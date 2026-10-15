@@ -240,6 +240,172 @@ def connect(
     )
 
 
+# --- SSH transport (Lightsail lane) -----------------------------------------
+# Lightsail instances have no SSM agent, so the dashboard (loopback-only on the
+# box) is reached over an SSH local-forward instead of an SSM port-forward. These
+# are the SSH analogs of mint_token / connect above; the readiness, ownership and
+# token-after-ready guards are identical, only the transport differs.
+
+# Non-interactive ssh options: no host-key prompt on a fresh box, no agent, use
+# only the key we pass. BatchMode fails fast instead of hanging on a prompt.
+_SSH_BASE_OPTS = [
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "StrictHostKeyChecking=accept-new",
+    "-o",
+    "UserKnownHostsFile=/dev/null",
+    "-o",
+    "ConnectTimeout=10",
+]
+
+
+def _ssh_target(ssh_host: str) -> str:
+    """``user@host`` as given, or ``ubuntu@host`` when no user is present."""
+    return ssh_host if "@" in ssh_host else f"ubuntu@{ssh_host}"
+
+
+def mint_token_ssh(
+    ssh_host: str, key_path: str, *, ttl: str = "6h", remote_port: int = DEFAULT_REMOTE_DASHBOARD_PORT
+) -> str:
+    """Mint a dashboard token on the box over SSH; return the bare token.
+
+    Runs ``kirocrew token`` on the instance via a one-shot SSH command and parses
+    the token out of the printed loopback URL. Returns "" if it could not be
+    obtained. The token transits the encrypted SSH channel (not SSM command
+    history), so the SSM mint's history caveat does not apply here.
+    """
+    cmd = [
+        "ssh",
+        *_SSH_BASE_OPTS,
+        "-i",
+        key_path,
+        _ssh_target(ssh_host),
+        f"kirocrew token --ttl {_safe_ttl(ttl)} 2>/dev/null | grep -m1 'token=' || true",
+    ]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        logger.warning("ssh token mint failed: %s", exc)
+        return ""
+    m = _TOKEN_RE.search((res.stdout or "").strip())
+    return m.group(1) if m else ""
+
+
+def open_ssh_forward(
+    ssh_host: str, key_path: str, remote_port: int, local_port: int
+) -> Optional[subprocess.Popen]:
+    """Spawn an ``ssh -N -L local:localhost:remote`` local-forward child.
+
+    Returns the Popen (caller owns teardown) or None if ssh could not be spawned.
+    """
+    cmd = [
+        "ssh",
+        *_SSH_BASE_OPTS,
+        "-i",
+        key_path,
+        "-N",
+        "-L",
+        f"{local_port}:127.0.0.1:{remote_port}",
+        _ssh_target(ssh_host),
+    ]
+    try:
+        return subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+        )
+    except OSError as exc:
+        logger.warning("could not spawn ssh forward: %s", exc)
+        return None
+
+
+def connect_ssh(
+    ssh_host: str,
+    key_path: str,
+    *,
+    instance_id: str = "",
+    remote_port: int = DEFAULT_REMOTE_DASHBOARD_PORT,
+    local_port: int = DEFAULT_LOCAL_PORT,
+    ttl: str = "6h",
+    open_browser: bool = True,
+) -> Connection:
+    """Open an SSH tunnel to the box, mint a token, and (optionally) open the dashboard.
+
+    The SSH analog of :func:`connect`. Same contract and ownership/teardown
+    guards; the only differences are the transport (``ssh -L`` instead of SSM)
+    and that the token mint rides the encrypted SSH channel. The caller owns
+    tunnel teardown via :meth:`Connection.close`.
+    """
+    # Import lazily to reuse the transport-agnostic socket probes without
+    # pulling the SSM module into every connect import path.
+    from kiro_crew.cloud.ssm import port_is_free, wait_for_local_port
+
+    iid = instance_id or ssh_host
+    if not port_is_free(local_port):
+        return Connection(
+            instance_id=iid,
+            local_port=local_port,
+            remote_port=remote_port,
+            ready=False,
+            error=(
+                f"local port {local_port} is already in use — close whatever is "
+                f"using it, or pass --local-port <n>, then retry."
+            ),
+        )
+    proc = open_ssh_forward(ssh_host, key_path, remote_port, local_port)
+    if proc is None:
+        return Connection(
+            instance_id=iid,
+            local_port=local_port,
+            remote_port=remote_port,
+            ready=False,
+            error="could not start ssh (is the OpenSSH client installed and on PATH?)",
+        )
+    ready = wait_for_local_port(local_port, proc=proc)
+    # Same free-check->bind race close as the SSM path: a listener answering
+    # while our ssh child has exited is a foreign process, not our tunnel.
+    if ready and proc.poll() is not None:
+        logger.warning(
+            "local port %d answered but the ssh child exited — refusing to route the "
+            "dashboard token to a foreign listener",
+            local_port,
+        )
+        ready = False
+    token = ""
+    url = ""
+    browser_opened = False
+    error = ""
+    if not ready:
+        error = (
+            "the SSH tunnel did not become ready — the box may still be installing "
+            "(wait ~2 min after launch and retry), or SSH (port 22) may be unreachable."
+        )
+        _terminate(proc)
+    else:
+        token = mint_token_ssh(ssh_host, key_path, ttl=ttl, remote_port=remote_port)
+        if not token:
+            error = (
+                "connected the SSH tunnel but could not mint a dashboard token on the "
+                "instance — the gateway may still be starting. Wait ~1 min and retry."
+            )
+            _terminate(proc)
+            ready = False
+        else:
+            url = build_url(local_port, token)
+            if open_browser and url:
+                browser_opened = _open_browser(url)
+    return Connection(
+        instance_id=iid,
+        local_port=local_port,
+        remote_port=remote_port,
+        token=token,
+        url=url,
+        ready=ready,
+        browser_opened=browser_opened,
+        error=error,
+        process=proc,
+    )
+
+
 # --- Instances registry integration (managed experience) --------------------
 
 

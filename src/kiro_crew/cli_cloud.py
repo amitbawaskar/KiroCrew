@@ -222,6 +222,12 @@ def _cloud_launch_lightsail(args: argparse.Namespace) -> int:
         return 1
 
     ui.ok(f"Launched '{job.tag}'. Added to Your crews.")
+    # Persist the tag so `connect`/`stop`/`start`/`destroy` resolve this instance
+    # without an explicit --tag, exactly as the EC2 wizard records its launch.
+    try:
+        LaunchState.record(profile=profile, region=region, last_tag=job.tag)
+    except Exception as exc:  # noqa: BLE001 - a record miss must not fail the launch
+        ui.detail(f"(Note: pass --tag {job.tag} to lifecycle commands if they can't find it: {exc})")
     ui.detail(f"Fixed price: ${bundle.usd_per_month:.0f}/month (SSD + {bundle.transfer_tb} TB "
               "transfer included).")
     ui.detail("Open the dashboard over an SSH tunnel: kirocrew cloud connect --provider lightsail")
@@ -296,7 +302,76 @@ def _cloud_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cloud_connect_lightsail(args: argparse.Namespace) -> int:
+    """Open the dashboard on a Lightsail crew over an SSH tunnel.
+
+    The Lightsail analog of the SSM connect path: resolve the instance by tag via
+    ``lightsail.describe`` (not ``ec2.describe``), download the region's default
+    SSH key, and open an ``ssh -L`` tunnel + mint a token over SSH. No
+    session-manager-plugin, no SSM — Lightsail has neither.
+    """
+    profile, region = _resolve(args)
+    tag = _resolve_tag(args)
+    try:
+        st = lightsail_mod.describe(tag, profile, region)
+    except AWSError as exc:
+        ui.fail(str(exc))
+        return 1
+    if not st.get("exists"):
+        ui.fail(f"No Lightsail instance for tag '{tag}'.")
+        ui.detail("Run `kirocrew cloud list --provider lightsail` to see instances.")
+        return 1
+    if st.get("state") != "running":
+        ui.fail(f"Lightsail instance '{tag}' is '{st.get('state') or 'unknown'}', not running.")
+        ui.detail("Start it with `kirocrew cloud start --provider lightsail`, then retry.")
+        return 1
+    public_ip = st.get("public_ip", "")
+    if not public_ip:
+        ui.fail(f"Lightsail instance '{tag}' has no public IP yet.")
+        return 1
+    user = st.get("username", "ubuntu") or "ubuntu"
+    ssh_host = f"{user}@{public_ip}"
+    try:
+        key = lightsail_mod.download_key(profile, region)
+    except AWSError as exc:
+        ui.fail(str(exc))
+        return 1
+    open_browser = not getattr(args, "no_browser", False)
+    local_port = getattr(args, "local_port", 0) or connect_mod.DEFAULT_LOCAL_PORT
+    if not 1 <= local_port <= 65535:
+        ui.fail(f"--local-port must be 1-65535 (got {local_port}).")
+        return 1
+    conn = connect_mod.connect_ssh(
+        ssh_host,
+        str(key),
+        instance_id=st.get("instance_id", ""),
+        local_port=local_port,
+        open_browser=open_browser,
+    )
+    if conn.ready and conn.url:
+        if conn.browser_opened:
+            ui.ok("Dashboard tunnel open.")
+        else:
+            ui.ok("Dashboard tunnel open. Open this URL in your browser:")
+        ui.note(f"{ui.CYAN}{conn.url}{ui.RESET}")
+        ui.detail("Leave this running to keep the tunnel open; Ctrl+C to close.")
+        ui.detail("Sign in to Kiro on the crew from the dashboard if prompted.")
+        try:
+            if conn.process:
+                conn.process.wait()
+        except KeyboardInterrupt:
+            conn.close()
+            ui.info("Tunnel closed.")
+        return 0
+    ui.fail("Dashboard tunnel did not become ready.")
+    if conn.error:
+        ui.detail(conn.error)
+    return 1
+
+
 def _cloud_connect(args: argparse.Namespace) -> int:
+    if _provider(args) == "lightsail":
+        return _cloud_connect_lightsail(args)
     profile, region = _resolve(args)
     if not _ensure_session_manager_plugin():
         return 1

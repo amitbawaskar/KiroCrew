@@ -399,3 +399,132 @@ class TestDeployOrdering:
         # The firewall change must come AFTER the instance was created, and (via
         # the state iterator) only once it reached `running`.
         assert calls.index("create-instances") < calls.index("put-instance-public-ports")
+
+
+# --- SSH key handling: connect needs the region default key ------------------
+class TestDownloadKey:
+    def test_downloads_and_stores_0600(self, monkeypatch, tmp_path):
+        import os as _os
+
+        from kiro_crew.config import loader as cfg_loader
+
+        monkeypatch.setattr(cfg_loader, "config_dir", lambda: tmp_path)
+        monkeypatch.setattr(
+            aws,
+            "checked_json",
+            lambda *a, **k: {"privateKeyBase64": "-----BEGIN KEY-----\nabc\n-----END KEY-----\n"},
+        )
+        path = lightsail.download_key(region="us-west-2")
+        assert path.exists()
+        assert path.read_text().startswith("-----BEGIN KEY-----")
+        # Owner-only perms (ssh refuses a group/world-readable key).
+        assert (_os.stat(path).st_mode & 0o077) == 0
+
+    def test_reuses_existing_key(self, monkeypatch, tmp_path):
+        from kiro_crew.config import loader as cfg_loader
+
+        monkeypatch.setattr(cfg_loader, "config_dir", lambda: tmp_path)
+        calls = {"n": 0}
+
+        def fake_json(*a, **k):
+            calls["n"] += 1
+            return {"privateKeyBase64": "-----BEGIN KEY-----\nx\n-----END KEY-----\n"}
+
+        monkeypatch.setattr(aws, "checked_json", fake_json)
+        p1 = lightsail.download_key(region="us-west-2")
+        p2 = lightsail.download_key(region="us-west-2")
+        assert p1 == p2
+        assert calls["n"] == 1  # second call reused the cached key, no AWS call
+
+    def test_raises_when_no_key_returned(self, monkeypatch, tmp_path):
+        from kiro_crew.config import loader as cfg_loader
+
+        monkeypatch.setattr(cfg_loader, "config_dir", lambda: tmp_path)
+        monkeypatch.setattr(aws, "checked_json", lambda *a, **k: {})
+        with pytest.raises(aws.AWSError):
+            lightsail.download_key(region="us-west-2")
+
+
+# --- SSH connect path (Lightsail lane) ---------------------------------------
+class TestConnectSsh:
+    def _patch_ports(self, monkeypatch, *, free=True, ready=True):
+        from kiro_crew.cloud import ssm
+
+        monkeypatch.setattr(ssm, "port_is_free", lambda *a, **k: free)
+        monkeypatch.setattr(ssm, "wait_for_local_port", lambda *a, **k: ready)
+
+    def test_refuses_occupied_local_port(self, monkeypatch):
+        from kiro_crew.cloud import connect
+
+        self._patch_ports(monkeypatch, free=False)
+        conn = connect.connect_ssh("ubuntu@203.0.113.5", "/tmp/k.pem", open_browser=False)
+        assert conn.ready is False
+        assert "already in use" in conn.error
+
+    def test_happy_path_mints_token_and_builds_url(self, monkeypatch):
+        from kiro_crew.cloud import connect
+
+        self._patch_ports(monkeypatch, ready=True)
+
+        class _Proc:
+            def poll(self):
+                return None  # still alive -> owns the port
+
+            def wait(self):
+                return 0
+
+        monkeypatch.setattr(connect, "open_ssh_forward", lambda *a, **k: _Proc())
+        monkeypatch.setattr(connect, "mint_token_ssh", lambda *a, **k: "JWT123")
+        monkeypatch.setattr(connect, "_open_browser", lambda url: True)
+        conn = connect.connect_ssh(
+            "ubuntu@203.0.113.5", "/tmp/k.pem", local_port=5599, open_browser=True
+        )
+        assert conn.ready is True
+        assert conn.token == "JWT123"
+        assert "token=JWT123" in conn.url
+        assert conn.browser_opened is True
+
+    def test_tears_down_when_token_mint_fails(self, monkeypatch):
+        from kiro_crew.cloud import connect
+
+        self._patch_ports(monkeypatch, ready=True)
+        terminated = {"n": 0}
+
+        class _Proc:
+            def poll(self):
+                return None
+
+        monkeypatch.setattr(connect, "open_ssh_forward", lambda *a, **k: _Proc())
+        monkeypatch.setattr(connect, "mint_token_ssh", lambda *a, **k: "")
+        monkeypatch.setattr(connect, "_terminate", lambda p: terminated.__setitem__("n", 1))
+        conn = connect.connect_ssh("ubuntu@203.0.113.5", "/tmp/k.pem", open_browser=False)
+        assert conn.ready is False
+        assert "token" in conn.error
+        assert terminated["n"] == 1  # the tunnel was torn down, no orphan
+
+    def test_refuses_when_ssh_child_exited_but_port_answers(self, monkeypatch):
+        # Free-check -> bind race: a listener answering while our ssh child is
+        # dead is a foreign process; the token must NOT be routed to it.
+        from kiro_crew.cloud import connect
+
+        self._patch_ports(monkeypatch, ready=True)
+
+        class _DeadProc:
+            def poll(self):
+                return 1  # exited
+
+        monkeypatch.setattr(connect, "open_ssh_forward", lambda *a, **k: _DeadProc())
+        minted = {"n": 0}
+        monkeypatch.setattr(
+            connect, "mint_token_ssh", lambda *a, **k: minted.__setitem__("n", 1) or "JWT"
+        )
+        monkeypatch.setattr(connect, "_terminate", lambda p: None)
+        conn = connect.connect_ssh("ubuntu@203.0.113.5", "/tmp/k.pem", open_browser=False)
+        assert conn.ready is False
+        assert minted["n"] == 0  # never minted a token for a foreign listener
+
+    def test_ssh_target_defaults_user(self):
+        from kiro_crew.cloud import connect
+
+        assert connect._ssh_target("203.0.113.5") == "ubuntu@203.0.113.5"
+        assert connect._ssh_target("admin@203.0.113.5") == "admin@203.0.113.5"

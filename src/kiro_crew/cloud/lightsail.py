@@ -38,6 +38,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Optional
 
 from kiro_crew.cloud import aws, sizes
@@ -452,6 +453,66 @@ def describe(tag: str, profile: str = "", region: str = "") -> dict[str, Any]:
         "region": (inst.get("location") or {}).get("regionName", region),
         "username": inst.get("username", "ubuntu"),
     }
+
+
+def key_path(region: str) -> "Path":
+    """Local path of the stored Lightsail default private key for ``region``.
+
+    One key per region under ``config_dir()/cloud-lightsail-keys/<region>.pem``.
+    Lightsail's default key pair is per-region, so every instance in a region
+    shares it; storing by region matches that and avoids a key file per instance.
+    """
+    from pathlib import Path as _Path
+
+    from kiro_crew.config.loader import config_dir
+
+    region = validate_region(region)
+    base = config_dir() / "cloud-lightsail-keys"
+    base.mkdir(parents=True, exist_ok=True)
+    return _Path(base) / f"{region or 'default'}.pem"
+
+
+def download_key(profile: str = "", region: str = "", *, force: bool = False) -> "Path":
+    """Fetch the region's Lightsail default private key and store it 0600 locally.
+
+    Runs ``aws lightsail download-default-key-pair`` (a read of the caller's own
+    account) and writes the PEM to :func:`key_path` with owner-only permissions,
+    which ``ssh`` requires. Idempotent: a key already present is reused unless
+    ``force`` is set. Returns the key path.
+
+    This is the SSH analog of the EC2 lane's "no key needed" (SSM) model: the
+    Lightsail lane has no SSM, so the SSH tunnel needs a private key, and the
+    region default key is the one Lightsail puts on every instance it creates
+    from a stock blueprint.
+    """
+    import os as _os
+
+    profile = validate_profile(profile)
+    region = validate_region(region)
+    path = key_path(region)
+    if path.exists() and not force:
+        return path
+    data = aws.checked_json(
+        ["lightsail", "download-default-key-pair"],
+        profile,
+        region,
+        action="lightsail:DownloadDefaultKeyPair",
+    )
+    pem = (data or {}).get("privateKeyBase64", "") if isinstance(data, dict) else ""
+    if not pem:
+        raise aws.AWSError(
+            "Lightsail returned no default key pair for this region. The default key may have "
+            "been deleted; connect over SSH needs it. Recreate the region default key in the "
+            "Lightsail console, or attach your own key at launch.",
+            action="lightsail:DownloadDefaultKeyPair",
+        )
+    # Field name is historical ("Base64") but the value is the PEM text itself.
+    tmp = path.with_suffix(".pem.tmp")
+    tmp.write_text(pem)
+    _os.chmod(tmp, 0o600)
+    tmp.replace(path)
+    _os.chmod(path, 0o600)
+    return path
 
 
 def list_instances(profile: str = "", region: str = "") -> list[dict[str, Any]]:
