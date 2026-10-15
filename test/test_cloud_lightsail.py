@@ -639,3 +639,31 @@ class TestSshForwardIsolatesProcessGroup:
             if proc is not None:
                 proc.kill()
                 proc.wait()
+
+
+class TestMintUsesLoginShell:
+    def test_mint_command_uses_login_shell(self, monkeypatch):
+        # Regression: `cloud connect` reached "could not mint a dashboard token"
+        # while the gateway was HTTP 200. Cause: the CLI installs to
+        # ~/.local/bin, which is on the LOGIN PATH but not a non-login one-shot
+        # SSH command's PATH, so the bare mint command was "command not found"
+        # and the pipe yielded nothing. The remote command MUST run via a login
+        # shell (bash -lc) so ~/.local/bin is on PATH.
+        from kiro_crew.cloud import connect
+
+        captured = {}
+
+        def fake_run(cmd, **kw):
+            captured["cmd"] = cmd
+
+            class R:
+                stdout = "http://localhost:5476/?token=JWTX"
+                returncode = 0
+
+            return R()
+
+        monkeypatch.setattr(connect.subprocess, "run", fake_run)
+        tok = connect.mint_token_ssh("ubuntu@203.0.113.7", "/tmp/k.pem", ttl="6h")
+        assert tok == "JWTX"
+        remote_arg = captured["cmd"][-1]
+        assert remote_arg.startswith("bash -lc "), remote_arg

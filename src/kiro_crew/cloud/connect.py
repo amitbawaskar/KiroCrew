@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import subprocess
 import sys
 import webbrowser
@@ -295,13 +296,19 @@ def mint_token_ssh(
     obtained. The token transits the encrypted SSH channel (not SSM command
     history), so the SSM mint's history caveat does not apply here.
     """
+    # Run through a LOGIN shell (bash -lc): the one-line installer puts the
+    # kirocrew entrypoint in ~/.local/bin, which is on the login PATH but NOT on
+    # a non-login one-shot SSH command's PATH (/usr/bin:/bin:…). Without -l the
+    # remote `kirocrew` is not found, the pipe yields nothing, and the mint
+    # silently fails with "could not mint a token" even though the gateway is up.
+    remote = f"kirocrew token --ttl {_safe_ttl(ttl)} 2>/dev/null | grep -m1 'token=' || true"
     cmd = [
         "ssh",
         *_SSH_BASE_OPTS,
         "-i",
         key_path,
         _ssh_target(ssh_host),
-        f"kirocrew token --ttl {_safe_ttl(ttl)} 2>/dev/null | grep -m1 'token=' || true",
+        f"bash -lc {shlex.quote(remote)}",
     ]
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
