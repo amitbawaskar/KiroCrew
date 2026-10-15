@@ -318,6 +318,36 @@ def open_ssh_forward(
         return None
 
 
+def _drain_ssh_output(proc: Optional[subprocess.Popen], *, limit: int = 400) -> str:
+    """Best-effort read of a failed ssh child's combined output for diagnostics.
+
+    ``open_ssh_forward`` routes stderr into the stdout pipe, so ssh's own
+    "Permission denied (publickey)" / "Connection refused" / "Connection timed
+    out" lands here. A failed child has already exited, so its pipe is at EOF and
+    the read returns at once; a short join bounds the pathological case. Returns a
+    compact one-line summary (last non-empty line, truncated), or "".
+    """
+    if proc is None or getattr(proc, "stdout", None) is None:
+        return ""
+    try:
+        proc.wait(timeout=_DRAIN_JOIN_TIMEOUT_SECS)
+    except Exception:  # noqa: BLE001 - still running / already reaped; read anyway
+        pass
+    try:
+        text = proc.stdout.read() or ""
+    except Exception:  # noqa: BLE001 - pipe closed/decode issue: nothing to show
+        return ""
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    # Prefer the last line that looks like ssh's actual verdict.
+    for ln in reversed(lines):
+        low = ln.lower()
+        if any(k in low for k in ("denied", "refused", "timed out", "timeout", "unreachable", "no route", "closed")):
+            return ln[:limit]
+    return lines[-1][:limit]
+
+
 def connect_ssh(
     ssh_host: str,
     key_path: str,
@@ -375,10 +405,16 @@ def connect_ssh(
     browser_opened = False
     error = ""
     if not ready:
+        ssh_output = _drain_ssh_output(proc)
         error = (
             "the SSH tunnel did not become ready — the box may still be installing "
             "(wait ~2 min after launch and retry), or SSH (port 22) may be unreachable."
         )
+        if ssh_output:
+            # ssh's own diagnostic is the one that actually tells auth failure
+            # (Permission denied), connection refused, and timeout apart. Surface
+            # it rather than making the user re-run ssh by hand to see it.
+            error += f"\n    ssh said: {ssh_output}"
         _terminate(proc)
     else:
         token = mint_token_ssh(ssh_host, key_path, ttl=ttl, remote_port=remote_port)
