@@ -588,3 +588,54 @@ class TestHeadlessBrowserDetection:
         monkeypatch.setenv("BROWSER", "firefox")
         monkeypatch.delenv("KIROCREW_NO_BROWSER", raising=False)
         assert connect._browser_open_supported() is True
+
+
+class TestSshForwardIsolatesProcessGroup:
+    def test_forward_child_has_its_own_process_group(self, monkeypatch):
+        # Regression: `cloud connect` died with "[1] terminated" on BOTH macOS
+        # and Linux, before printing the URL. Root cause: open_ssh_forward
+        # spawned ssh WITHOUT start_new_session, so the child shared the CLI's
+        # process group. _terminate() tears the tunnel down with
+        # os.killpg(getpgid(child)) — which, on a shared group, SIGTERMs the
+        # parent CLI (and the shell's foreground group) too. The forward child
+        # MUST be its own session/group leader so killpg can't reach the parent.
+        import os
+        import sys
+        from kiro_crew.cloud import connect
+
+        if not hasattr(os, "setsid"):
+            import pytest as _pytest
+
+            _pytest.skip("POSIX-only process-group semantics")
+
+        # Replace the ssh binary with a tiny python that just sleeps, so we get a
+        # real child process to inspect its process group.
+        monkeypatch.setattr(
+            connect,
+            "_SSH_BASE_OPTS",
+            [],
+        )
+        # Build a Popen directly via the real open_ssh_forward but swap argv[0].
+        real_popen = connect.subprocess.Popen
+
+        captured = {}
+
+        def fake_popen(cmd, **kw):
+            captured["kw"] = kw
+            # run a harmless sleeper instead of ssh
+            return real_popen(
+                [sys.executable, "-c", "import time;time.sleep(5)"], **kw
+            )
+
+        monkeypatch.setattr(connect.subprocess, "Popen", fake_popen)
+        proc = connect.open_ssh_forward("ubuntu@203.0.113.9", "/tmp/k.pem", 5476, 5599)
+        try:
+            assert proc is not None
+            # The decisive assertions: start_new_session was requested, and the
+            # child's process group differs from ours (so killpg(child) spares us).
+            assert captured["kw"].get("start_new_session") is True
+            assert os.getpgid(proc.pid) != os.getpgid(0)
+        finally:
+            if proc is not None:
+                proc.kill()
+                proc.wait()

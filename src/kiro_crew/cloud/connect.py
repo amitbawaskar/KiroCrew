@@ -331,7 +331,17 @@ def open_ssh_forward(
     ]
     try:
         return subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            # CRITICAL: own session/process group. _terminate() tears the tunnel
+            # down with os.killpg(getpgid(child)); without start_new_session the
+            # child shares THIS process's group, so that killpg signals the
+            # parent CLI (and the shell's foreground group) too — the process
+            # dies with "[1] terminated" before it can print the URL, on every
+            # OS. The SSM path (open_port_forward) sets this for the same reason.
+            start_new_session=True,
         )
     except OSError as exc:
         logger.warning("could not spawn ssh forward: %s", exc)
