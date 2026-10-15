@@ -100,6 +100,14 @@ DEFAULT_BLUEPRINT_ID = "ubuntu_22_04"
 #: user-data via ``deploy(user_data=...)``.
 _INSTALL_URL = "https://download.crew.kiro.dev/cli.sh"
 
+#: Official Kiro CLI installer. kiro-cli is a HARD runtime prerequisite for the
+#: agent backend (see kiro_prerequisite.py) and the KiroCrew installer above does
+#: NOT pull it, so a stock-OS cloud box has the gateway but no agent runtime. We
+#: install it in the bootstrap for parity with the EC2 lane, which installs
+#: kiro-cli as part of its source install.sh flow. Sign-in stays a post-connect
+#: human step (device flow needs a browser; see login.py).
+_KIRO_CLI_INSTALL_URL = "https://cli.kiro.dev/install"
+
 
 def validate_profile(profile: str) -> str:
     return validate_field(profile, _PROFILE_SPEC) or ""
@@ -146,7 +154,9 @@ class DeployResult:
     argv: list[str] = field(default_factory=list)
 
 
-def default_cloud_init(*, install_url: str = _INSTALL_URL) -> str:
+def default_cloud_init(
+    *, install_url: str = _INSTALL_URL, kiro_cli_url: str = _KIRO_CLI_INSTALL_URL
+) -> str:
     """The cloud-init ``--user-data`` script that installs Kiro Crew on first boot.
 
     Mirrors the EC2 lane's UserData intent: install the CLI via the public
@@ -178,9 +188,18 @@ RUN_USER="${{SUDO_USER:-ubuntu}}"
 id "$RUN_USER" >/dev/null 2>&1 || RUN_USER=ubuntu
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y || true
-apt-get install -y curl ca-certificates || true
+# curl + ca-certificates for the installers; unzip is a REQUIRED dependency of
+# the kiro-cli installer ("Missing required dependencies: unzip") and is not on
+# a stock Ubuntu Lightsail image.
+apt-get install -y curl ca-certificates unzip || true
 # One-line installer, as the non-root user (writes to its home).
 sudo -u "$RUN_USER" -H bash -lc 'curl -fsSL {install_url} | sh'
+# Install kiro-cli, the agent-backend runtime KiroCrew requires to run turns.
+# The KiroCrew installer above does not pull it, so without this the box has a
+# gateway but no agent runtime. Non-fatal (|| true): a kiro-cli install hiccup
+# should not abort the whole bootstrap and leave no gateway; sign-in and a
+# retry can happen post-connect.
+sudo -u "$RUN_USER" -H bash -lc 'curl -fsSL {kiro_cli_url} | bash' || true
 # Install + enable the gateway as a lingering user service so it survives logout.
 sudo -u "$RUN_USER" -H bash -lc 'kirocrew service install' || true
 loginctl enable-linger "$RUN_USER" || true

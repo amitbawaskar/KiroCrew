@@ -667,3 +667,19 @@ class TestMintUsesLoginShell:
         assert tok == "JWTX"
         remote_arg = captured["cmd"][-1]
         assert remote_arg.startswith("bash -lc "), remote_arg
+
+
+class TestBootstrapInstallsKiroCli:
+    def test_bootstrap_installs_the_agent_runtime(self):
+        # kiro-cli is a hard runtime prerequisite (kiro_prerequisite.py). The
+        # KiroCrew installer does not pull it, so a stock-OS box would have a
+        # gateway but no agent runtime. The bootstrap MUST install it, matching
+        # the EC2 lane which installs kiro-cli as part of its source install.sh.
+        script = lightsail.default_cloud_init()
+        assert "cli.kiro.dev/install" in script
+        # Installed as the non-root user, same as the KiroCrew install.
+        assert "sudo -u" in script
+        # unzip is a REQUIRED dependency of the kiro-cli installer and is absent
+        # on a stock Ubuntu Lightsail image; a live launch failed with
+        # "Missing required dependencies: unzip" until the bootstrap installed it.
+        assert "unzip" in script
