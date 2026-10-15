@@ -163,8 +163,16 @@ def default_cloud_init(*, install_url: str = _INSTALL_URL) -> str:
     # The gateway binds 127.0.0.1 by default; we do NOT open any dashboard port
     # in the Lightsail firewall (see deploy()). Reached via `kirocrew cloud
     # connect` over an SSH tunnel.
-    return f"""#!/bin/bash
-set -euxo pipefail
+    # POSIX sh, NOT bash: Lightsail's Ubuntu blueprint wraps user-data with its
+    # own init preamble (SSH CA setup) before running it, which pushes our
+    # shebang off line 1 so the script executes under /bin/sh (dash). dash has
+    # no `set -o pipefail` ("Illegal option -o pipefail"), so a `#!/bin/bash` +
+    # `set -euxo pipefail` dies on line 2 before anything installs. We also do
+    # NOT want pipefail regardless: install.sh's progress spinner writes \\r
+    # through a pipe, and pipefail turns a harmless SIGPIPE into a fatal
+    # mid-install kill (the EC2 lane documents the same). Keep it `set -ex`.
+    return f"""#!/bin/sh
+set -ex
 # Run the install as the default non-root user, not root.
 RUN_USER="${{SUDO_USER:-ubuntu}}"
 id "$RUN_USER" >/dev/null 2>&1 || RUN_USER=ubuntu

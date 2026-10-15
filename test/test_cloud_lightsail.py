@@ -108,6 +108,19 @@ class TestBootstrapScript:
         # Install runs as the non-root user, not root.
         assert "sudo -u" in script
 
+    def test_bootstrap_is_posix_sh_safe(self):
+        # Regression: a live launch failed with
+        #   /var/lib/cloud/instance/scripts/part-001: set: Illegal option -o pipefail
+        # because Lightsail wraps user-data with its own init preamble, pushing
+        # our shebang off line 1 so the script runs under /bin/sh (dash). dash
+        # has no `set -o pipefail`, so the script died before installing
+        # anything and the gateway never came up. The bootstrap MUST be
+        # POSIX-sh safe: no `pipefail`, no bash-only `set` options.
+        script = lightsail.default_cloud_init()
+        assert "pipefail" not in script, "pipefail breaks under dash and risks a SIGPIPE kill"
+        first_line = script.lstrip().splitlines()[0]
+        assert first_line == "#!/bin/sh", f"expected POSIX sh shebang, got {first_line!r}"
+
 
 class TestDeployDryRun:
     def test_dry_run_builds_argv_without_calling_aws(self, monkeypatch):
