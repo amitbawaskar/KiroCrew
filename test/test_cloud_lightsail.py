@@ -350,3 +350,52 @@ class TestLightsailDenyRules:
         assert "aws-destructive-lightsail-delete-instance" in ids
         assert "aws-destructive-lightsail-create-instances" in ids
         assert "aws-destructive-lightsail-instance-lifecycle" in ids
+
+
+# --- deploy ordering: firewall must open only after the instance is running --
+class TestDeployOrdering:
+    """Lightsail rejects put-instance-public-ports while an instance is `pending`
+    (OperationFailureException, "cannot change the ports ... in transition"). A
+    live launch surfaced this because the unit tests mocked each AWS call in
+    isolation and could not see call ordering. This records the real sequence and
+    pins create-instances -> (running) -> put-instance-public-ports.
+    """
+
+    def test_open_ssh_happens_after_running(self, monkeypatch):
+        calls: list[str] = []
+
+        def fake_checked(argv, profile, region, **kw):
+            # argv[0]="lightsail", argv[1]=the verb
+            calls.append(argv[1])
+            return 0, "", ""
+
+        # describe is polled by wait_for_running; return `pending` the first time
+        # then `running`, so the test proves open_ssh waits for the transition.
+        states = iter(["pending", "running", "running"])
+
+        def fake_describe(tag, profile="", region=""):
+            try:
+                state = next(states)
+            except StopIteration:
+                state = "running"
+            return {"state": state, "public_ip": "203.0.113.5", "instance_id": "kirocrew-t1"}
+
+        monkeypatch.setattr(aws, "checked", fake_checked)
+        monkeypatch.setattr(lightsail, "find_instance", lambda *a, **k: None)
+        monkeypatch.setattr(lightsail, "describe", fake_describe)
+        monkeypatch.setattr(lightsail, "_RUNNING_POLL_SECS", 0)
+        monkeypatch.setattr(aws, "assert_human_action", lambda *a, **k: None)
+
+        lightsail.deploy(
+            tag="t1",
+            tier=sizes.default_tier(),
+            bundle_id="large_3_0",
+            profile="dev",
+            region="us-west-2",
+        )
+
+        assert "create-instances" in calls
+        assert "put-instance-public-ports" in calls
+        # The firewall change must come AFTER the instance was created, and (via
+        # the state iterator) only once it reached `running`.
+        assert calls.index("create-instances") < calls.index("put-instance-public-ports")

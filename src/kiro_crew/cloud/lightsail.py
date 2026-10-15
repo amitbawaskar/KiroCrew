@@ -292,12 +292,16 @@ def deploy(
     if not reused:
         aws.checked(argv, profile, region, action="lightsail:CreateInstances", timeout=_POLL_TIMEOUT)
 
+    # Wait for the box to reach `running` BEFORE touching the firewall. Lightsail
+    # rejects put-instance-public-ports while the instance is `pending` with
+    # OperationFailureException ("cannot change the ports of an instance while it
+    # is in transition"), so the firewall change must come after the control-plane
+    # transition settles. (The slow cloud-init install is gated separately by the
+    # engine's gateway health poll.)
+    wait_for_running(tag, profile, region)
+
     # Open SSH (port 22) only — the gateway is loopback-only and reached by tunnel.
     open_ssh(tag, profile, region)
-
-    # Wait for the box to reach `running` (quick control-plane transition). The
-    # slow cloud-init install is gated by the engine's gateway health poll.
-    wait_for_running(tag, profile, region)
 
     st = describe(tag, profile, region)
     return DeployResult(
@@ -355,7 +359,14 @@ def wait_for_running(tag: str, profile: str = "", region: str = "") -> str:
         if state == "running":
             return state
         time.sleep(_RUNNING_POLL_SECS)
-    return state
+    # Timed out before `running`. Opening the firewall now would fail with the
+    # same in-transition OperationFailureException, so fail loud and specific
+    # instead of letting the caller hit a confusing downstream error.
+    raise aws.AWSError(
+        f"Lightsail instance {instance_name(tag)} did not reach 'running' within "
+        f"{_RUNNING_TIMEOUT}s (last observed state: {state or 'unknown'}).",
+        action="lightsail:GetInstanceState",
+    )
 
 
 # --- discovery / status -----------------------------------------------------
