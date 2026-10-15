@@ -248,11 +248,17 @@ def connect(
 
 # Non-interactive ssh options: no host-key prompt on a fresh box, no agent, use
 # only the key we pass. BatchMode fails fast instead of hanging on a prompt.
+# StrictHostKeyChecking=no (NOT accept-new): a cloud box regenerates its host
+# keys every launch so there is nothing stable to pin, and `accept-new` is
+# rejected by older OpenSSH clients ("unsupported option accept-new"), which
+# broke connect on hosts shipping an older ssh. Paired with
+# UserKnownHostsFile=/dev/null the key is discarded regardless, so `no` and
+# `accept-new` are behaviourally identical here minus the compat break.
 _SSH_BASE_OPTS = [
     "-o",
     "BatchMode=yes",
     "-o",
-    "StrictHostKeyChecking=accept-new",
+    "StrictHostKeyChecking=no",
     "-o",
     "UserKnownHostsFile=/dev/null",
     "-o",

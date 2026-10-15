@@ -541,3 +541,20 @@ class TestConnectSsh:
 
         assert connect._ssh_target("203.0.113.5") == "ubuntu@203.0.113.5"
         assert connect._ssh_target("admin@203.0.113.5") == "admin@203.0.113.5"
+
+
+class TestSshConnectOptsCompat:
+    def test_base_opts_avoid_accept_new(self):
+        # Regression: a live `cloud connect` on a host with an older OpenSSH
+        # client failed with
+        #   command-line line 0: unsupported option "accept-new".
+        # `StrictHostKeyChecking=accept-new` is not understood by older ssh.
+        # A cloud box regenerates host keys each launch (nothing to pin), so
+        # we use the universally-supported `no` + UserKnownHostsFile=/dev/null.
+        from kiro_crew.cloud import connect
+
+        opts = connect._SSH_BASE_OPTS
+        assert "StrictHostKeyChecking=accept-new" not in opts
+        assert "StrictHostKeyChecking=no" in opts
+        assert "UserKnownHostsFile=/dev/null" in opts
+        assert "BatchMode=yes" in opts
