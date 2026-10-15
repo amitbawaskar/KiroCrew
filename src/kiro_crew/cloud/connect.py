@@ -61,12 +61,26 @@ class Connection:
     url: str = ""
     ready: bool = False
     browser_opened: bool = False
+    #: Whether the caller requested a browser-open. The SSH path does NOT open
+    #: the browser inside connect_ssh (it can block the tty before the URL is
+    #: printed); the caller prints the URL then calls maybe_open_browser().
+    want_browser: bool = False
     error: str = ""
     process: Optional[subprocess.Popen] = None
 
     def close(self) -> None:
         """Tear down the SSM port-forward child AND its plugin child."""
         _kill_process_tree(self.process)
+
+    def maybe_open_browser(self) -> bool:
+        """Open the dashboard in a browser if the caller wanted it. Best-effort.
+
+        Call this AFTER printing the URL so a blocking/failing browser-open can
+        never hide the URL from the user. Records and returns browser_opened.
+        """
+        if self.want_browser and self.url and not self.browser_opened:
+            self.browser_opened = _open_browser(self.url)
+        return self.browser_opened
 
 
 def mint_token(instance_id: str, profile: str = "", region: str = "", *, ttl: str = "6h") -> str:
@@ -433,8 +447,13 @@ def connect_ssh(
             ready = False
         else:
             url = build_url(local_port, token)
-            if open_browser and url:
-                browser_opened = _open_browser(url)
+            # NB: the browser-open is deliberately NOT done here. On some hosts
+            # webbrowser.open() blocks the foreground (a text browser attached to
+            # the tty), which would stall before the caller ever prints the URL,
+            # leaving the user with no URL and a hung process. The caller prints
+            # the URL FIRST, then opens the browser via maybe_open_browser(),
+            # so a blocking/failing open can never hide the URL. open_browser is
+            # recorded on the Connection so the caller knows whether to try.
     return Connection(
         instance_id=iid,
         local_port=local_port,
@@ -443,6 +462,7 @@ def connect_ssh(
         url=url,
         ready=ready,
         browser_opened=browser_opened,
+        want_browser=open_browser,
         error=error,
         process=proc,
     )
@@ -771,15 +791,26 @@ def _safe_ttl(ttl: str) -> str:
 
 
 def _browser_open_supported() -> bool:
-    """Return false in headless Linux shells where webbrowser would call gio/xdg-open."""
+    """Return false in headless Linux shells where webbrowser would call gio/xdg-open.
+
+    A terminal-mode BROWSER (lynx/w3m/elinks/links/…) is treated as NO browser:
+    webbrowser.open() would launch it in the FOREGROUND attached to this tty,
+    blocking forever and swallowing the terminal before the URL is ever printed
+    (observed on a dev desktop whose dotfiles set BROWSER=w3m). On a headless
+    host we want to print the URL, not hand the tty to a text browser.
+    """
     if os.environ.get("KIROCREW_NO_BROWSER"):
         return False
     if sys.platform.startswith("linux"):
-        return bool(
-            os.environ.get("DISPLAY")
-            or os.environ.get("WAYLAND_DISPLAY")
-            or os.environ.get("BROWSER")
+        browser = os.environ.get("BROWSER", "")
+        # A text-mode browser blocks the foreground — treat it as unsupported.
+        _TERMINAL_BROWSERS = ("lynx", "w3m", "elinks", "links", "links2", "edbrowse")
+        browser_is_terminal = any(
+            tb in browser.lower() for tb in _TERMINAL_BROWSERS
         )
+        if browser and not browser_is_terminal:
+            return True
+        return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
     return True
 
 

@@ -495,6 +495,12 @@ class TestConnectSsh:
         assert conn.ready is True
         assert conn.token == "JWT123"
         assert "token=JWT123" in conn.url
+        # connect_ssh no longer opens the browser inline (it can block the tty
+        # before the URL is printed). It records the intent; the caller opens it
+        # AFTER printing the URL via maybe_open_browser().
+        assert conn.want_browser is True
+        assert conn.browser_opened is False
+        assert conn.maybe_open_browser() is True
         assert conn.browser_opened is True
 
     def test_tears_down_when_token_mint_fails(self, monkeypatch):
@@ -558,3 +564,27 @@ class TestSshConnectOptsCompat:
         assert "StrictHostKeyChecking=no" in opts
         assert "UserKnownHostsFile=/dev/null" in opts
         assert "BatchMode=yes" in opts
+
+
+class TestHeadlessBrowserDetection:
+    def test_terminal_browser_env_is_treated_as_headless(self, monkeypatch):
+        # Regression: a dev desktop with BROWSER=w3m (or lynx/elinks) made
+        # webbrowser.open() launch a text browser in the FOREGROUND, blocking
+        # the tty forever so `cloud connect` printed no URL and was SIGTERMed.
+        # A terminal-mode BROWSER must be treated as "no browser" so we print
+        # the URL instead of handing over the terminal.
+        from kiro_crew.cloud import connect
+
+        for bad in ("w3m", "/usr/bin/lynx", "elinks -remote", "links2"):
+            monkeypatch.setenv("BROWSER", bad)
+            monkeypatch.delenv("DISPLAY", raising=False)
+            monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+            monkeypatch.delenv("KIROCREW_NO_BROWSER", raising=False)
+            assert connect._browser_open_supported() is False, bad
+
+    def test_graphical_browser_env_still_supported(self, monkeypatch):
+        from kiro_crew.cloud import connect
+
+        monkeypatch.setenv("BROWSER", "firefox")
+        monkeypatch.delenv("KIROCREW_NO_BROWSER", raising=False)
+        assert connect._browser_open_supported() is True

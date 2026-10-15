@@ -349,11 +349,12 @@ def _cloud_connect_lightsail(args: argparse.Namespace) -> int:
         open_browser=open_browser,
     )
     if conn.ready and conn.url:
-        if conn.browser_opened:
-            ui.ok("Dashboard tunnel open.")
-        else:
-            ui.ok("Dashboard tunnel open. Open this URL in your browser:")
+        # Print the URL FIRST, then try the browser. A browser-open that blocks
+        # or fails on a headless/remote host must never hide the URL.
+        ui.ok("Dashboard tunnel open. Open this URL in your browser:")
         ui.note(f"{ui.CYAN}{conn.url}{ui.RESET}")
+        if conn.maybe_open_browser():
+            ui.detail("(opened in your default browser)")
         ui.detail("Leave this running to keep the tunnel open; Ctrl+C to close.")
         ui.detail("Sign in to Kiro on the crew from the dashboard if prompted.")
         try:
