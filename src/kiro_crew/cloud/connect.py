@@ -346,6 +346,71 @@ def register_instance(
         return None
 
 
+def register_instance_ssh(
+    ssh_host: str,
+    *,
+    name: str,
+    profile: str = "",
+    region: str = "",
+    remote_port: int = DEFAULT_REMOTE_DASHBOARD_PORT,
+    provisioner_id: str = BUILTIN_PROVISIONER_ID,
+) -> Optional[str]:
+    """Register an SSH-transport box in the Instances registry (the Lightsail lane).
+
+    The SSH sibling of :func:`register_instance`. Lightsail instances have no SSM
+    agent to tunnel through, so the dashboard reaches them over an SSH tunnel: the
+    record carries ``connection_method="ssh"`` and *ssh_host* (``user@public-ip``)
+    instead of an ``ssm_target``. Everything else -- the loopback-only gateway, the
+    token refresh, the forward -- is the dashboard's existing SSH transport, which
+    predates this lane (it is how a hand-added Remote crew over SSH already
+    works), so no new connect machinery is added here.
+
+    *ssh_host* is ``user@host`` (e.g. ``ubuntu@203.0.113.5``) -- the registry's SSH
+    charset admits the ``@``. *provisioner_id* records the lane that created the
+    box so the dashboard shows the right lifecycle guidance and resolves the
+    Lightsail engine for Stop/Start/Delete.
+
+    Best-effort: returns the registered instance id, or None if the Instances
+    feature isn't available. Idempotent per box: a re-launch updates the prior
+    record in place (matched by ``ssh_host``), preserving its id, allocated local
+    port, TTL and sticky connect intent -- rather than accumulating duplicates.
+    """
+    if not ssh_host:
+        return None
+    try:
+        from kiro_crew.instances.registry import InstancesRegistry
+    except Exception:  # pragma: no cover - instances feature absent
+        logger.info("Instances feature unavailable; skipping SSH registration")
+        return None
+    try:
+        reg = InstancesRegistry()
+        for existing in reg.list():
+            if ssh_host == existing.ssh_host:
+                reg.update(
+                    existing.id,
+                    connection_method="ssh",
+                    ssh_host=ssh_host,
+                    aws_profile=profile,
+                    aws_region=region,
+                    remote_port=remote_port,
+                    provisioner_id=provisioner_id,
+                )
+                return existing.id
+        inst = reg.add(
+            name=name,
+            connection_method="ssh",
+            ssh_host=ssh_host,
+            aws_profile=profile,
+            aws_region=region,
+            remote_port=remote_port,
+            provisioner_id=provisioner_id,
+        )
+        return inst.id
+    except Exception as exc:  # pragma: no cover - non-fatal
+        logger.info("could not register SSH instance in Instances registry: %s", exc)
+        return None
+
+
 def is_launched_instance(ssm_target: str) -> bool:
     """True if *ssm_target* (an EC2 instance id) was provisioned by a Kiro Crew
     cloud launch, per the launch job store — i.e. it is a *correlated* instance,

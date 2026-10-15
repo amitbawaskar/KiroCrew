@@ -356,6 +356,65 @@ when the platform will take the VM. Because teardown acts on the stored
 process choose which VM the next delete destroys, so the file is a write-protected
 target in `security/paths.py`.
 
+## The Lightsail lane
+
+A crew on the `lightsail` lane runs on an AWS Lightsail instance in the owner's own
+account — a FIXED-PRICE plan (a "bundle") instead of metered EC2, which is the
+lane's reason to exist: the headline cost is one predictable monthly number with
+bandwidth and SSD included. It is `cloud/lightsail.py` (the lifecycle verbs) plus
+`cloud/lightsail_engine.py` (the `LaunchEngine`), the parallel of the EC2
+`ec2.py`/`launch_engine.py` pair, and like them every AWS call goes through the one
+`aws` CLI chokepoint — no boto3.
+
+**Why it is a sibling of EC2, not a reuse.** The EC2 lane provisions a
+CloudFormation stack and tears it down with one `delete-stack`; Lightsail has no
+stack machinery. An instance is one `create-instances` call against a bundle and a
+blueprint, its firewall is `put-instance-public-ports`, and teardown is
+`delete-instance`. So the five-verb surface (`deploy`/`status`/`stop`/`start`/
+`destroy`) is reimplemented over Lightsail primitives rather than parameterised onto
+EC2.
+
+**Bootstrap, mirroring EC2.** The shipping EC2 lane does not use a pre-baked AMI: it
+boots a stock Amazon Linux image and installs Kiro Crew from UserData, gating a
+CloudFormation WaitCondition on the gateway coming healthy. Lightsail has no
+WaitCondition, so `blueprint_id` defaults to a stock Ubuntu LTS blueprint plus a
+`--user-data` cloud-init script that runs the public one-line installer, and
+`LightsailLaunchEngine.provision` polls the instance to healthy itself. Passing a
+published Kiro Crew Lightsail blueprint id instead switches to the pre-baked image
+(no install wait) with no other change — one code path, a config knob, so the lane
+is useful today and upgrades to the baked image the day that blueprint publishes.
+
+**Size mapping.** The lane reuses the same `light`/`balanced`/`power` size keys as
+EC2 (identical picker), mapped to Lightsail bundles in `cloud/sizes.py`
+(`lightsail_bundle`). The 16/32/64 GB Linux general-purpose bundles match the EC2
+tiers' vCPU 1:1, so there is no RAM-floor gap, and because a bundle is flat-priced
+the lane can show a REAL `$X/month` where the EC2 lane only shows an illustrative
+hourly rate.
+
+**Connection.** A Lightsail instance has no SSM agent, so a launched crew is
+recorded as an Instances row with `provisioner_id = "aws_lightsail"` and the
+`ssh` connection method, `ssh_host = <user>@<public-ip>` — the dashboard's existing
+SSH tunnel reaches it, the same transport a hand-added Remote-crew-over-SSH record
+uses. `connect.register_instance_ssh` is the SSH sibling of `register_instance`.
+The gateway is loopback-only on the box and the firewall opens port 22 only (never
+the dashboard port), the SSH analog of the EC2 security group's "no inbound
+dashboard port".
+
+**Sign-in.** This lane drives no remote device-code sign-in (it has no SSM
+transport to run one over, and the box is a full gateway the user signs in to
+themselves after `cloud connect`). `LightsailSigninHandle` therefore completes
+without a prompt — the same shape as `FargateSigninHandle` and the EC2 engine's own
+SSM-failure fallback — so the launch still reaches `register` and the crew is
+visible rather than stranded behind a sign-in step that cannot run; the connect
+step's detail tells the user to sign in to Kiro after they connect.
+
+**Agent-session guard.** The read-only Lightsail calls `cloud list`/`status` need
+(`get-instance`/`get-instances`/`get-bundles`/`get-regions`) are added to the agent
+chokepoint allowlist in `cloud/aws.py`; every mutating `lightsail` verb stays
+refused from an agent session, and `delete-instance`/`create-instances`/
+`stop`/`start`/`reboot-instance`/`put-instance-public-ports` are also blocked for
+the agent by the `aws-destructive-lightsail-*` deny rules.
+
 ## Where launch state lives
 
 Two files, two owners. `cloud.json` is the OPERATOR's: they hand-write the `fargate` block

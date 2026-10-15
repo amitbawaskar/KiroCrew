@@ -1518,7 +1518,8 @@ class TestProvisionerSeam:
         )
         assert resp.status == 200
         rows = _body(resp)["provisioners"]
-        assert [r["id"] for r in rows] == ["aws_ec2"]
+        # EC2 and Lightsail are both always offered (neither needs a config block).
+        assert [r["id"] for r in rows] == ["aws_ec2", "aws_lightsail"]
         assert rows[0]["kind"] == "aws_ec2"
         assert rows[0]["posix_only"] is True
         assert [s["key"] for s in rows[0]["steps"]] == [

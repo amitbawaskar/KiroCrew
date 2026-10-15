@@ -111,6 +111,15 @@ _AGENT_READ_ALLOWLIST: frozenset = frozenset(
         ("cloudformation", "list-stacks"),
         ("ssm", "describe-instance-information"),
         ("resourcegroupstaggingapi", "get-resources"),
+        # Lightsail read-only discovery for `cloud list`/`status`/`doctor`
+        # (the Lightsail lane's analog of the ec2 describe calls above). Only
+        # the read calls the status/discovery paths actually make; a mutating
+        # lightsail verb (create/delete/stop/start-instance,
+        # put-instance-public-ports) is NOT here and stays refused.
+        ("lightsail", "get-instance"),
+        ("lightsail", "get-instances"),
+        ("lightsail", "get-bundles"),
+        ("lightsail", "get-regions"),
     }
 )
 

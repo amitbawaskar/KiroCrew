@@ -2558,6 +2558,13 @@ Examples:
             "--profile", default="", help="AWS profile name (default: saved / CLI default)"
         )
         p.add_argument("--region", default="", help="AWS region (default: saved / us-east-1)")
+        p.add_argument(
+            "--provider",
+            default="",
+            choices=["", "ec2", "lightsail"],
+            help="Cloud provider lane (default: ec2). 'lightsail' launches/manages a "
+            "fixed-price AWS Lightsail instance instead of EC2.",
+        )
 
     def _cloud_common(p: "argparse.ArgumentParser") -> None:
         _cloud_creds_opts(p)

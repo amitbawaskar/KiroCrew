@@ -788,6 +788,34 @@ BUILTIN_DENIED_RULES: list[DeniedCommandRule] = [
         ),
     ),
     DeniedCommandRule(
+        id="aws-destructive-lightsail-delete-instance",
+        pattern="aws(?:\\s+--?[a-z-]+(?:[= ]\\S+)?)*\\s+lightsail(?:\\s+--?[a-z-]+(?:[= ]\\S+)?)*\\s+delete-.*",
+        category="aws-destructive",
+        description=(
+            "Blocks any 'aws lightsail delete-*' command, which permanently deletes a Lightsail "
+            "instance (and its data) or other Lightsail resources."
+        ),
+    ),
+    DeniedCommandRule(
+        id="aws-destructive-lightsail-create-instances",
+        pattern="aws(?:\\s+--?[a-z-]+(?:[= ]\\S+)?)*\\s+lightsail(?:\\s+--?[a-z-]+(?:[= ]\\S+)?)*\\s+create-instances(?:-from-snapshot)?.*",
+        category="aws-destructive",
+        description=(
+            "Blocks 'aws lightsail create-instances', which launches new fixed-price Lightsail "
+            "instances that incur cost and can be abused for resource sprawl."
+        ),
+    ),
+    DeniedCommandRule(
+        id="aws-destructive-lightsail-instance-lifecycle",
+        pattern="aws(?:\\s+--?[a-z-]+(?:[= ]\\S+)?)*\\s+lightsail(?:\\s+--?[a-z-]+(?:[= ]\\S+)?)*\\s+(stop-instance|start-instance|reboot-instance|put-instance-public-ports).*",
+        category="aws-destructive",
+        description=(
+            "Blocks Lightsail instance lifecycle/firewall mutations "
+            "(stop/start/reboot-instance, put-instance-public-ports), which can interrupt a "
+            "running crew or widen its network exposure."
+        ),
+    ),
+    DeniedCommandRule(
         id="aws-destructive-eks-delete-cluster",
         pattern="aws(?:\\s+--?[a-z-]+(?:[= ]\\S+)?)*\\s+eks(?:\\s+--?[a-z-]+(?:[= ]\\S+)?)*\\s+delete-cluster.*",
         category="aws-destructive",

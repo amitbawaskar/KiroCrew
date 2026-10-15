@@ -162,3 +162,102 @@ def default_tier() -> SizeTier:
 def monthly_estimate(tier: SizeTier, hours_per_day: float = 24.0) -> float:
     """Approximate USD/month for a tier at the given daily uptime (display only)."""
     return round(tier.approx_usd_per_hr * hours_per_day * 30, 2)
+
+
+# --- Lightsail bundle mapping ------------------------------------------------
+# The Lightsail lane reuses the SAME size keys (light/balanced/power), so the
+# user picks a tier identically — only the compute underneath differs. Lightsail
+# bundles are FIXED monthly price with bandwidth and SSD included, so unlike the
+# EC2 `approx_usd_per_hr` (illustrative only, display-suppressed on the
+# dashboard) the Lightsail monthly figure is a REAL number the UI can show.
+#
+# Kept as a separate catalog rather than a field on SizeTier so the EC2
+# `instance_type` stays EC2-specific and the x86 lane (which Lightsail does not
+# mirror) needs no touching.
+#
+# The 16/32/64 GB Linux general-purpose bundles map 1:1 to the EC2 tiers' vCPU
+# counts (16 GB=4 vCPU, 32 GB=8 vCPU, 64 GB=16 vCPU), so there is no RAM-floor
+# gap. The bundle *ids* here are the current public ``*_3_0`` general-purpose
+# ids; a launch resolves the exact available id for the chosen region with
+# ``aws lightsail get-bundles`` (the engine falls back to these when it cannot).
+
+
+@dataclass(frozen=True)
+class LightsailBundle:
+    """A Lightsail bundle a size tier maps to (the fixed-price-plan analog of an
+    EC2 instance type)."""
+
+    key: str  # the SAME tier key the EC2 lane uses (light/balanced/power)
+    bundle_id: str  # Lightsail bundle id, e.g. "large_3_0"
+    vcpu: int
+    ram_gb: int
+    disk_gb: int  # bundle SSD, included in the price
+    transfer_tb: int  # monthly data transfer, included in the price
+    usd_per_month: float  # FIXED monthly price (real, not illustrative)
+
+    def summary(self) -> str:
+        """One-line human summary for menus and confirmations."""
+        return (
+            f"{self.ram_gb} GB · {self.vcpu} vCPU · {self.disk_gb} GB SSD · "
+            f"{self.transfer_tb} TB transfer  ${self.usd_per_month:.0f}/mo"
+        )
+
+
+# Keyed by the same tier keys as the EC2 ladder. Only the three default-menu
+# tiers are mapped (Lightsail has no separate x86 lane); the specs match the EC2
+# tiers' vCPU exactly, so the picker is identical and the mapping is 1:1.
+_LIGHTSAIL_BUNDLES: tuple[LightsailBundle, ...] = (
+    LightsailBundle(
+        key="light",
+        bundle_id="large_3_0",
+        vcpu=4,
+        ram_gb=16,
+        disk_gb=320,
+        transfer_tb=6,
+        usd_per_month=84.0,
+    ),
+    LightsailBundle(
+        key="balanced",
+        bundle_id="xlarge_3_0",
+        vcpu=8,
+        ram_gb=32,
+        disk_gb=640,
+        transfer_tb=7,
+        usd_per_month=164.0,
+    ),
+    LightsailBundle(
+        key="power",
+        bundle_id="2xlarge_3_0",
+        vcpu=16,
+        ram_gb=64,
+        disk_gb=1280,
+        transfer_tb=8,
+        usd_per_month=384.0,
+    ),
+)
+
+LIGHTSAIL_BUNDLES_BY_KEY: dict[str, LightsailBundle] = {b.key: b for b in _LIGHTSAIL_BUNDLES}
+
+# The Lightsail lane offers the same interactive keys as EC2.
+LIGHTSAIL_INTERACTIVE_KEYS = ("light", "balanced", "power")
+
+
+def lightsail_bundle(key: str) -> LightsailBundle:
+    """Resolve a Lightsail bundle by tier key; raise ``KeyError`` with the valid set.
+
+    A key the EC2 ladder has but Lightsail does not map (the x86 lane) raises,
+    naming the Lightsail keys — so a ``--size light-x86 --provider lightsail`` is
+    refused with an actionable message rather than silently falling back.
+    """
+    try:
+        return LIGHTSAIL_BUNDLES_BY_KEY[key]
+    except KeyError:
+        valid = ", ".join(LIGHTSAIL_BUNDLES_BY_KEY)
+        raise KeyError(
+            f"size '{key}' has no Lightsail bundle (choose one of: {valid})"
+        ) from None
+
+
+def lightsail_bundles() -> tuple[LightsailBundle, ...]:
+    """All Lightsail bundles, in display order (light → balanced → power)."""
+    return _LIGHTSAIL_BUNDLES

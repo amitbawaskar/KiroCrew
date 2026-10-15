@@ -753,6 +753,31 @@ MICROVM_REMOTE_PROVISIONER = RemoteProvisioner(
 )
 
 
+#: The id a launch request names as ``provider_id`` for the Lightsail lane.
+LIGHTSAIL_PROVISIONER_ID = "aws_lightsail"
+
+#: The Lightsail descriptor. Like EC2 it needs NO configuration block (the
+#: blueprint defaults to the stock-Ubuntu bootstrap path), so ``provisioners()``
+#: always offers it. ``kind`` equals the id, so the dashboard looks for a renderer
+#: registered under that kind and skips the row when none is -- absent rather than
+#: broken, the same skip the Fargate/microvm lanes rely on until a frontend form
+#: for the kind ships. The CLI reaches it today via ``cloud launch --provider
+#: lightsail`` regardless of the selector.
+#:
+#: The steps are relabelled only where the EC2 wording would be slightly off:
+#: provision says "Lightsail instance" so the user is not told an EC2 instance is
+#: being created.
+LIGHTSAIL_REMOTE_PROVISIONER = RemoteProvisioner(
+    id=LIGHTSAIL_PROVISIONER_ID,
+    kind=LIGHTSAIL_PROVISIONER_ID,
+    label="AWS Lightsail in your own account",
+    posix_only=True,
+    step_labels=(
+        ("provision", "Create the Lightsail instance and install Kiro Crew"),
+    ),
+)
+
+
 class DefaultRemoteProvisionerProvider:
     """The provisioners the core ships: EC2 always, Fargate when it is configured.
 
@@ -789,6 +814,11 @@ class DefaultRemoteProvisionerProvider:
 
     def provisioners(self) -> List[RemoteProvisioner]:
         rows = [BUILTIN_REMOTE_PROVISIONER]
+        # Lightsail is always offered, like EC2: it needs no configuration block
+        # (the blueprint defaults to the stock-Ubuntu bootstrap path) and nothing
+        # in cloud.json chooses what receives a credential, so there is nothing to
+        # confirm before launch.
+        rows.append(LIGHTSAIL_REMOTE_PROVISIONER)
         config = self._fargate_config()
         if config is not None:
             # The row carries the resolved credential recipient, so the operator READS it
@@ -833,6 +863,17 @@ class DefaultRemoteProvisionerProvider:
             # ``cloud.json`` chooses what receives a credential. A value passed for it
             # is ignored rather than refused, so a caller may confirm uniformly.
             return RealLaunchEngine()
+        if provisioner_id == LIGHTSAIL_PROVISIONER_ID:
+            # circular import: ``cloud.lightsail_engine`` reaches this module's graph
+            # through ``cloud.lightsail`` -> ``cloud.aws`` -> ``sandbox`` ->
+            # ``platform``, so a module-scope import here would close the loop.
+            # Deferring also keeps platform init off the cloud module graph.
+            from kiro_crew.cloud.lightsail_engine import LightsailLaunchEngine
+
+            # Like EC2: no credential recipient in cloud.json to confirm. The
+            # blueprint defaults to the stock-Ubuntu bootstrap; a published Kiro
+            # Crew blueprint id is a future config knob, not a per-launch secret.
+            return LightsailLaunchEngine()
         if provisioner_id == MICROVM_PROVISIONER_ID:
             return self._microvm_engine(confirmed_recipient=confirmed_recipient)
         if provisioner_id != FARGATE_PROVISIONER_ID:

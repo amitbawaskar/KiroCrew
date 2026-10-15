@@ -120,7 +120,10 @@ class TestCatalog:
         # Then: the sandbox-escape ssh-to-self row was added (111 -> 112). The
         # flagged-file delivery self-protection floor added no row: it is an
         # ungated argv-floor subcommand (see ``_UNGATED_TEMPLATES``), not a catalog rule.
-        assert len(BUILTIN_DENIED_RULES) == 113
+        # Then: the three aws-destructive Lightsail rows (delete-instance,
+        # create-instances, instance-lifecycle) for the `kirocrew cloud --provider
+        # lightsail` lane (113 -> 116).
+        assert len(BUILTIN_DENIED_RULES) == 116
         ids = [r.id for r in BUILTIN_DENIED_RULES]
         assert len(set(ids)) == len(BUILTIN_DENIED_RULES)
 
