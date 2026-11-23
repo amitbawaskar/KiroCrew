@@ -19,6 +19,7 @@ import sys
 from kiro_crew.cloud import aws
 from kiro_crew.cloud import connect as connect_mod
 from kiro_crew.cloud import ec2, iam
+from kiro_crew.cloud import lightsail as lightsail_mod
 from kiro_crew.cloud import login as login_mod
 from kiro_crew.cloud import sizes, ssm, ui, wizard
 from kiro_crew.cloud.aws import AWSError, CloudActionDenied
@@ -84,6 +85,18 @@ def _resolve_tag(args: argparse.Namespace) -> str:
     return state.last_tag
 
 
+def _provider(args: argparse.Namespace) -> str:
+    """The cloud provider lane for this invocation: ``"ec2"`` (default) or ``"lightsail"``.
+
+    Resolved from the explicit ``--provider`` flag only. The launch state record
+    persists profile/region/tag but not the provider, so a lifecycle verb on a
+    Lightsail instance currently needs ``--provider lightsail`` (or the dashboard,
+    which resolves the lane from the Instances record). Defaulting to ``ec2``
+    keeps every existing invocation byte-identical.
+    """
+    return (getattr(args, "provider", "") or "ec2").strip() or "ec2"
+
+
 def _resolve_login_target(args: argparse.Namespace, *, inherit: bool) -> "KiroLoginTarget":
     """The Kiro identity a cloud command signs the crew in as.
 
@@ -143,6 +156,8 @@ def _resolve_login_target(args: argparse.Namespace, *, inherit: bool) -> "KiroLo
 
 
 def _cloud_launch(args: argparse.Namespace) -> int:
+    if _provider(args) == "lightsail":
+        return _cloud_launch_lightsail(args)
     profile, region = _resolve(args)
     skip_login = bool(getattr(args, "no_login", False))
     try:
@@ -187,9 +202,115 @@ def _cloud_launch(args: argparse.Namespace) -> int:
     )
 
 
+def _cloud_launch_lightsail(args: argparse.Namespace) -> int:
+    """Non-interactive Lightsail launch, driving the durable launch job + engine.
+
+    The EC2 ``launch`` goes through the rich interactive ``wizard.launch``; the
+    Lightsail lane instead drives the same durable launch job the dashboard uses
+    (``launch_job.run_launch`` with ``LightsailLaunchEngine``), printing step
+    progress. This keeps the lane's launch path identical to the dashboard's and
+    avoids forking the EC2-specific wizard.
+    """
+    from kiro_crew.cloud import launch_job
+    from kiro_crew.cloud.lightsail_engine import LIGHTSAIL_PROVISIONER_ID, LightsailLaunchEngine
+    from kiro_crew.platform.defaults import LIGHTSAIL_REMOTE_PROVISIONER
+
+    profile, region = _resolve(args)
+    size_key = getattr(args, "size", "") or sizes.DEFAULT_TIER_KEY
+    # Validate the size resolves to a Lightsail bundle BEFORE provisioning.
+    try:
+        bundle = sizes.lightsail_bundle(size_key)
+    except KeyError as exc:
+        ui.fail(str(exc))
+        return 2
+
+    try:
+        ssh_cidr = lightsail_mod.validate_ssh_cidr((getattr(args, "ssh_cidr", "") or "").strip())
+    except ValidationError as exc:
+        ui.fail(str(exc))
+        return 2
+
+    # Bundle ids and prices differ by region, so read them for this region.
+    resolved = lightsail_mod.resolve_bundle(size_key, profile, region)
+
+    ui.note(f"{ui.BOLD}Launching a Kiro Crew Lightsail crew{ui.RESET}")
+    ui.detail(
+        f"size {size_key}: {bundle.ram_gb} GB · {bundle.vcpu} vCPU · {bundle.disk_gb} GB SSD · "
+        f"{bundle.transfer_tb} TB transfer  (region {region}, provider lightsail)"
+    )
+    ui.detail(f"blueprint: {lightsail_mod.KIRO_CREW_BLUEPRINT_ID}")
+    ui.detail(f"ssh from: {ssh_cidr or 'any address (pass --ssh-cidr to restrict)'}")
+
+    store = launch_job.LaunchJobStore()
+    job = store.create(
+        profile=profile,
+        region=region,
+        size_key=size_key,
+        provider_id=LIGHTSAIL_PROVISIONER_ID,
+        step_labels=dict(LIGHTSAIL_REMOTE_PROVISIONER.step_labels),
+    )
+    engine = LightsailLaunchEngine(ssh_cidr=ssh_cidr)
+    try:
+        with ui.Spinner("Provisioning the Lightsail instance and waiting for Kiro Crew to start…"):
+            job = launch_job.run_launch(job, store, engine)
+    except CloudActionDenied:
+        raise
+    except AWSError as exc:
+        ui.fail(str(exc))
+        return 1
+
+    if job.status == launch_job.FAILED:
+        ui.fail(f"Launch failed: {job.error or 'unknown error'}")
+        for step in job.steps:
+            if step.state == launch_job.STEP_FAILED:
+                ui.detail(f"  {step.label}: {step.detail}")
+        return 1
+
+    ui.ok(f"Launched '{job.tag}'. Added to Your crews.")
+    # Persist the tag so `connect`/`stop`/`start`/`destroy` resolve this instance
+    # without an explicit --tag, exactly as the EC2 wizard records its launch.
+    try:
+        LaunchState.record(profile=profile, region=region, last_tag=job.tag)
+    except Exception as exc:  # noqa: BLE001 - a record miss must not fail the launch
+        ui.detail(f"(Note: pass --tag {job.tag} to lifecycle commands if they can't find it: {exc})")
+    approx = "" if resolved.live else " (approximate: live pricing could not be read)"
+    ui.detail(
+        f"Price: ${resolved.usd_per_month:.0f}/month in {region}{approx}. SSD and transfer "
+        "are included; snapshots and static IPs are billed separately."
+    )
+    if engine.gateway_ready is False:
+        ui.detail(
+            "Kiro Crew was not answering yet when the launch stopped waiting. Give it a "
+            "minute, then connect."
+        )
+    ui.detail("Open the dashboard over an SSH tunnel: kirocrew cloud connect --provider lightsail")
+    if not job.signin_detected:
+        ui.detail("Sign in to Kiro on the crew from the dashboard after you connect.")
+    return 0
+
+
 def _cloud_list(args: argparse.Namespace) -> int:
     profile, region = _resolve(args)
     _note_unchosen_region(args, region, "list")
+    if _provider(args) == "lightsail":
+        try:
+            rows = lightsail_mod.list_instances(profile, region)
+        except AWSError as exc:
+            ui.fail(str(exc))
+            return 1
+        if not rows:
+            ui.info("No Kiro Crew Lightsail instances found.")
+            ui.detail("Launch one with: kirocrew cloud launch --provider lightsail")
+            return 0
+        ui.note(f"{ui.BOLD}Kiro Crew Lightsail instances ({region}):{ui.RESET}")
+        for r in rows:
+            state = r.get("instance_state", "?")
+            ip = r.get("public_ip", "")
+            ui.note(
+                f"  {ui.BOLD}{r['tag']}{ui.RESET}  {r['instance_id']}  "
+                f"{ui.DIM}{state}{ui.RESET}  {ip}"
+            )
+        return 0
     try:
         rows = ec2.list_instances(profile, region)
     except AWSError as exc:
@@ -209,6 +330,21 @@ def _cloud_list(args: argparse.Namespace) -> int:
 def _cloud_status(args: argparse.Namespace) -> int:
     profile, region = _resolve(args)
     tag = _resolve_tag(args)
+    if _provider(args) == "lightsail":
+        try:
+            st = lightsail_mod.describe(tag, profile, region)
+        except AWSError as exc:
+            ui.fail(str(exc))
+            return 1
+        if not st.get("exists"):
+            ui.info(f"No Lightsail instance found for tag '{tag}'.")
+            return 0
+        ui.note(f"{ui.BOLD}{tag}{ui.RESET}")
+        ui.detail(f"instance: {st.get('instance_id', '')} [{st.get('state', '?')}]")
+        ui.detail(f"public:   {st.get('public_ip', '') or '(none yet)'}")
+        ui.detail(f"bundle:   {st.get('bundle_id', '')}  blueprint: {st.get('blueprint_id', '')}")
+        ui.detail(f"region:   {st.get('region', region)}")
+        return 0
     st = ec2.describe(tag, profile, region)
     if not st.get("exists"):
         ui.info(f"No instance found for tag '{tag}'.")
@@ -223,7 +359,77 @@ def _cloud_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cloud_connect_lightsail(args: argparse.Namespace) -> int:
+    """Open the dashboard on a Lightsail crew over an SSH tunnel.
+
+    The Lightsail analog of the SSM connect path: resolve the instance by tag via
+    ``lightsail.describe`` (not ``ec2.describe``), download the region's default
+    SSH key, and open an ``ssh -L`` tunnel + mint a token over SSH. No
+    session-manager-plugin, no SSM — Lightsail has neither.
+    """
+    profile, region = _resolve(args)
+    tag = _resolve_tag(args)
+    try:
+        st = lightsail_mod.describe(tag, profile, region)
+    except AWSError as exc:
+        ui.fail(str(exc))
+        return 1
+    if not st.get("exists"):
+        ui.fail(f"No Lightsail instance for tag '{tag}'.")
+        ui.detail("Run `kirocrew cloud list --provider lightsail` to see instances.")
+        return 1
+    if st.get("state") != "running":
+        ui.fail(f"Lightsail instance '{tag}' is '{st.get('state') or 'unknown'}', not running.")
+        ui.detail("Start it with `kirocrew cloud start --provider lightsail`, then retry.")
+        return 1
+    public_ip = st.get("public_ip", "")
+    if not public_ip:
+        ui.fail(f"Lightsail instance '{tag}' has no public IP yet.")
+        return 1
+    user = st.get("username", "ubuntu") or "ubuntu"
+    ssh_host = f"{user}@{public_ip}"
+    try:
+        key = lightsail_mod.download_key(profile, region)
+    except AWSError as exc:
+        ui.fail(str(exc))
+        return 1
+    open_browser = not getattr(args, "no_browser", False)
+    local_port = getattr(args, "local_port", 0) or connect_mod.DEFAULT_LOCAL_PORT
+    if not 1 <= local_port <= 65535:
+        ui.fail(f"--local-port must be 1-65535 (got {local_port}).")
+        return 1
+    conn = connect_mod.connect_ssh(
+        ssh_host,
+        str(key),
+        instance_id=st.get("instance_id", ""),
+        local_port=local_port,
+        open_browser=open_browser,
+    )
+    if conn.ready and conn.url:
+        # Print the URL FIRST, then try the browser. A browser-open that blocks
+        # or fails on a headless/remote host must never hide the URL.
+        ui.ok("Dashboard tunnel open. Open this URL in your browser:")
+        ui.note(f"{ui.CYAN}{conn.url}{ui.RESET}")
+        if conn.maybe_open_browser():
+            ui.detail("(opened in your default browser)")
+        ui.detail("Leave this running to keep the tunnel open; Ctrl+C to close.")
+        ui.detail("Sign in to Kiro on the crew from the dashboard if prompted.")
+        try:
+            if conn.process:
+                conn.process.wait()
+        except KeyboardInterrupt:
+            conn.close()
+            ui.info("Tunnel closed.")
+        return 0
+    ui.fail("Dashboard tunnel did not become ready.")
+    if conn.error:
+        ui.detail(conn.error)
+    return 1
+
+
 def _cloud_connect(args: argparse.Namespace) -> int:
+    if _provider(args) == "lightsail":
+        return _cloud_connect_lightsail(args)
     profile, region = _resolve(args)
     if not _ensure_session_manager_plugin():
         return 1
@@ -396,26 +602,99 @@ def _cloud_logout(args: argparse.Namespace) -> int:
 def _cloud_stop(args: argparse.Namespace) -> int:
     profile, region = _resolve(args)
     tag = _resolve_tag(args)
+    lane = _provider(args)
     try:
-        ec2.stop(tag, profile, region)
+        if lane == "lightsail":
+            lightsail_mod.stop(tag, profile, region)
+        else:
+            ec2.stop(tag, profile, region)
     except AWSError as exc:
         ui.fail(str(exc))
         return 1
-    ui.ok(f"Stopped '{tag}'. Compute billing paused (EBS storage still bills).")
-    ui.detail("Resume with: kirocrew cloud start")
+    if lane == "lightsail":
+        ui.ok(f"Stopped '{tag}'. Compute billing paused.")
+    else:
+        ui.ok(f"Stopped '{tag}'. Compute billing paused (EBS storage still bills).")
+    ui.detail("Resume with: kirocrew cloud start" + (" --provider lightsail" if lane == "lightsail" else ""))
     return 0
 
 
 def _cloud_start(args: argparse.Namespace) -> int:
     profile, region = _resolve(args)
     tag = _resolve_tag(args)
+    lane = _provider(args)
     try:
-        ec2.start(tag, profile, region)
+        if lane == "lightsail":
+            lightsail_mod.start(tag, profile, region)
+        else:
+            ec2.start(tag, profile, region)
     except AWSError as exc:
         ui.fail(str(exc))
         return 1
+    if lane == "lightsail":
+        # The instance gets a new public IP on restart (unless a static IP is
+        # attached) and its dashboard record is keyed on that IP, so wait for it
+        # and update the record.
+        from kiro_crew.cloud.lightsail_engine import refresh_registration
+
+        try:
+            lightsail_mod.wait_for_running(tag, profile, region)
+            if refresh_registration(tag, profile, region):
+                ui.detail("Updated the crew's saved address to the new public IP.")
+        except AWSError as exc:
+            ui.warn(f"Started, but could not refresh the saved address: {exc}")
     ui.ok(f"Starting '{tag}'. It'll be reachable again shortly.")
-    ui.detail("Reopen the dashboard with: kirocrew cloud connect")
+    ui.detail("Reopen the dashboard with: kirocrew cloud connect" + (" --provider lightsail" if lane == "lightsail" else ""))
+    return 0
+
+
+def _cloud_destroy_lightsail(
+    args: argparse.Namespace, profile: str, region: str, tag: str
+) -> int:
+    """Full teardown of a Lightsail crew: delete the instance, drop its registration."""
+    if getattr(args, "dry_run", False):
+        res = lightsail_mod.destroy(tag, profile, region, dry_run=True)
+        ui.info("Dry run — would run:")
+        ui.detail("aws " + " ".join(res["argv"]))
+        return 0
+
+    st = lightsail_mod.describe(tag, profile, region)
+    if not st.get("exists"):
+        ui.info(f"No Lightsail instance found for tag '{tag}' — nothing to remove.")
+        return 0
+
+    ui.warn(f"This will PERMANENTLY delete the '{tag}' Lightsail instance:")
+    ui.detail(f"instance {st.get('instance_id', '')} ({st.get('public_ip', '')}).")
+    ui.detail("Any data on the instance is lost. This cannot be undone.")
+    if not getattr(args, "yes", False):
+        if not ui.confirm(f"Remove Kiro Crew Lightsail instance '{tag}' from AWS?", default=False):
+            ui.info("Aborted — nothing was deleted.")
+            return 0
+
+    try:
+        with ui.Spinner("Deleting the Lightsail instance…"):
+            res = lightsail_mod.destroy(tag, profile, region)
+    except AWSError as exc:
+        ui.fail(str(exc))
+        return 1
+
+    if not res.get("destroyed"):
+        ui.warn("Delete started but did not confirm completion — the instance may still exist.")
+        ui.detail("Check `kirocrew cloud status --provider lightsail`; re-run destroy if needed.")
+        return 1
+
+    # Drop the SSH Instances registration (best-effort) now the box is gone.
+    public_ip = st.get("public_ip", "")
+    if public_ip:
+        user = st.get("username", "ubuntu") or "ubuntu"
+        connect_mod.unregister_instance(f"{user}@{public_ip}")
+
+    try:
+        LaunchState.clear_tag(tag)
+    except OSError as exc:
+        ui.warn(f"Removed the instance, but could not clear the saved pointer to it: {exc}")
+
+    ui.ok(f"Removed '{tag}' — the Lightsail instance is deleted. You won't be billed for it.")
     return 0
 
 
@@ -423,6 +702,9 @@ def _cloud_destroy(args: argparse.Namespace) -> int:
     """Full uninstall / remove-from-AWS: delete the whole stack."""
     profile, region = _resolve(args)
     tag = _resolve_tag(args)
+
+    if _provider(args) == "lightsail":
+        return _cloud_destroy_lightsail(args, profile, region, tag)
 
     # Before the dry run too, so it never offers to delete a stack the real run cannot find.
     st = ec2.describe(tag, profile, region)

@@ -18,6 +18,8 @@ from kiro_crew.platform.defaults import (
     BUILTIN_REMOTE_PROVISIONER,
     FARGATE_PROVISIONER_ID,
     FARGATE_REMOTE_PROVISIONER,
+    LIGHTSAIL_PROVISIONER_ID,
+    LIGHTSAIL_REMOTE_PROVISIONER,
     DefaultRemoteProvisionerProvider,
 )
 from kiro_crew.platform.interfaces import (
@@ -74,7 +76,10 @@ class TestFargateLane:
     ):
         monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
         provider = DefaultRemoteProvisionerProvider()
-        assert [p.id for p in provider.provisioners()] == [BUILTIN_PROVISIONER_ID]
+        assert [p.id for p in provider.provisioners()] == [
+            BUILTIN_PROVISIONER_ID,
+            LIGHTSAIL_PROVISIONER_ID,
+        ]
         with pytest.raises(KeyError):
             provider.engine_for(FARGATE_PROVISIONER_ID)
 
@@ -90,6 +95,7 @@ class TestFargateLane:
         provider = DefaultRemoteProvisionerProvider()
         assert [p.id for p in provider.provisioners()] == [
             BUILTIN_PROVISIONER_ID,
+            LIGHTSAIL_PROVISIONER_ID,
             FARGATE_PROVISIONER_ID,
         ]
         engine = provider.engine_for(FARGATE_PROVISIONER_ID)
@@ -182,7 +188,10 @@ class TestFargateLane:
         self._write_config(config_dir(), {**self._complete_block(), "task_ttl_seconds": 0})
 
         provider = DefaultRemoteProvisionerProvider()
-        assert [p.id for p in provider.provisioners()] == [BUILTIN_PROVISIONER_ID]
+        assert [p.id for p in provider.provisioners()] == [
+            BUILTIN_PROVISIONER_ID,
+            LIGHTSAIL_PROVISIONER_ID,
+        ]
         with pytest.raises(KeyError):
             provider.engine_for(FARGATE_PROVISIONER_ID)
 
@@ -202,7 +211,10 @@ class TestFargateLane:
 
         self._write_config(config_dir(), {"cluster": "only-a-cluster"})
         provider = DefaultRemoteProvisionerProvider()
-        assert [p.id for p in provider.provisioners()] == [BUILTIN_PROVISIONER_ID]
+        assert [p.id for p in provider.provisioners()] == [
+            BUILTIN_PROVISIONER_ID,
+            LIGHTSAIL_PROVISIONER_ID,
+        ]
         with pytest.raises(KeyError):
             provider.engine_for(FARGATE_PROVISIONER_ID)
 
@@ -222,7 +234,10 @@ class TestFargateLane:
 
         self._write_config(config_dir(), {**self._complete_block(), "secrets": []})
         provider = DefaultRemoteProvisionerProvider()
-        assert [p.id for p in provider.provisioners()] == [BUILTIN_PROVISIONER_ID]
+        assert [p.id for p in provider.provisioners()] == [
+            BUILTIN_PROVISIONER_ID,
+            LIGHTSAIL_PROVISIONER_ID,
+        ]
         with pytest.raises(KeyError):
             provider.engine_for(FARGATE_PROVISIONER_ID)
 
@@ -239,7 +254,10 @@ class TestFargateLane:
 
         monkeypatch.setattr(cloud_config.CloudConfig, "load", classmethod(boom))
         provider = DefaultRemoteProvisionerProvider()
-        assert [p.id for p in provider.provisioners()] == [BUILTIN_PROVISIONER_ID]
+        assert [p.id for p in provider.provisioners()] == [
+            BUILTIN_PROVISIONER_ID,
+            LIGHTSAIL_PROVISIONER_ID,
+        ]
 
     def test_the_block_is_read_per_call_not_cached(self, monkeypatch, tmp_path):
         """An operator who edits the file gets the answer from the next request."""
@@ -247,11 +265,17 @@ class TestFargateLane:
         from kiro_crew.config.loader import config_dir
 
         provider = DefaultRemoteProvisionerProvider()
-        assert [p.id for p in provider.provisioners()] == [BUILTIN_PROVISIONER_ID]
+        assert [p.id for p in provider.provisioners()] == [
+            BUILTIN_PROVISIONER_ID,
+            LIGHTSAIL_PROVISIONER_ID,
+        ]
         self._write_config(config_dir(), self._complete_block())
         assert FARGATE_PROVISIONER_ID in [p.id for p in provider.provisioners()]
         (config_dir() / "cloud.json").unlink()
-        assert [p.id for p in provider.provisioners()] == [BUILTIN_PROVISIONER_ID]
+        assert [p.id for p in provider.provisioners()] == [
+            BUILTIN_PROVISIONER_ID,
+            LIGHTSAIL_PROVISIONER_ID,
+        ]
 
     def test_the_descriptor_names_its_own_kind_so_the_dashboard_skips_it(self):
         """``kind`` equals the id, deliberately.
@@ -331,7 +355,9 @@ class TestDescriptor:
 class TestDefaultProvider:
     def test_lists_exactly_the_builtin(self):
         rows = DefaultRemoteProvisionerProvider().provisioners()
-        assert rows == [BUILTIN_REMOTE_PROVISIONER]
+        # EC2 and Lightsail are both always offered (neither needs a config
+        # block); Fargate/microvm are added only when their block is complete.
+        assert rows == [BUILTIN_REMOTE_PROVISIONER, LIGHTSAIL_REMOTE_PROVISIONER]
 
     def test_engine_for_the_builtin_is_the_ec2_engine(self):
         eng = DefaultRemoteProvisionerProvider().engine_for(BUILTIN_PROVISIONER_ID)
@@ -541,7 +567,10 @@ class TestTheOperatorCanReadTheRecipientBeforeConfirming:
         nothing to show and nothing to confirm."""
         provider = self._provider(monkeypatch, tmp_path, {**self._block(), "cluster": ""})
 
-        assert [p.id for p in provider.provisioners()] == [BUILTIN_PROVISIONER_ID]
+        assert [p.id for p in provider.provisioners()] == [
+            BUILTIN_PROVISIONER_ID,
+            LIGHTSAIL_PROVISIONER_ID,
+        ]
 
     def test_the_descriptor_declares_the_field(self):
         """On the shared descriptor, so an edition's lane can carry one too rather than the

@@ -265,7 +265,11 @@ class TestProvisionerRegistration:
             defaults.DefaultRemoteProvisionerProvider, "_fargate_config", staticmethod(lambda: None)
         )
         provider = defaults.DefaultRemoteProvisionerProvider()
-        assert [row.id for row in provider.provisioners()] == [defaults.BUILTIN_PROVISIONER_ID]
+        # EC2 and Lightsail need no configuration block, so both are always offered.
+        assert [row.id for row in provider.provisioners()] == [
+            defaults.BUILTIN_PROVISIONER_ID,
+            defaults.LIGHTSAIL_PROVISIONER_ID,
+        ]
 
     def test_a_complete_block_offers_the_lane(self, monkeypatch):
         """Registration is what makes a lane reachable, and it is reachable now.
@@ -312,7 +316,7 @@ class TestProvisionerRegistration:
         )
         rows = {row.id: row for row in defaults.DefaultRemoteProvisionerProvider().provisioners()}
         assert defaults.MICROVM_PROVISIONER_ID not in rows
-        assert list(rows) == [defaults.BUILTIN_PROVISIONER_ID]
+        assert list(rows) == [defaults.BUILTIN_PROVISIONER_ID, defaults.LIGHTSAIL_PROVISIONER_ID]
 
     def test_the_descriptor_and_its_recipient_are_ready_for_that_commit(self):
         """What the row WILL carry, pinned so re-enabling it is one append.

@@ -810,6 +810,13 @@ Examples:
             "--profile", default="", help="AWS profile name (default: saved / CLI default)"
         )
         p.add_argument("--region", default="", help="AWS region (default: saved / us-east-1)")
+        p.add_argument(
+            "--provider",
+            default="",
+            choices=["", "ec2", "lightsail"],
+            help="Cloud provider lane (default: ec2). 'lightsail' launches/manages a "
+            "fixed-price AWS Lightsail instance instead of EC2.",
+        )
 
     def _cloud_common(p: "argparse.ArgumentParser") -> None:
         _cloud_creds_opts(p)
@@ -845,6 +852,13 @@ Examples:
         default="",
         choices=_cloud_size_choices(),
         help="Instance size tier (default: balanced / interactive picker)",
+    )
+    _c_launch.add_argument(
+        "--ssh-cidr",
+        default="",
+        metavar="CIDR",
+        help="Lightsail only: allow SSH only from this IPv4 CIDR (e.g. 203.0.113.7/32; "
+        "/16 or narrower) and close the IPv6 rule. Default: SSH open to any address.",
     )
     _c_launch.add_argument(
         "--subnet",

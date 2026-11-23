@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import subprocess
 import sys
 import webbrowser
@@ -61,12 +62,26 @@ class Connection:
     url: str = ""
     ready: bool = False
     browser_opened: bool = False
+    #: Whether the caller requested a browser-open. The SSH path does NOT open
+    #: the browser inside connect_ssh (it can block the tty before the URL is
+    #: printed); the caller prints the URL then calls maybe_open_browser().
+    want_browser: bool = False
     error: str = ""
     process: Optional[subprocess.Popen] = None
 
     def close(self) -> None:
         """Tear down the SSM port-forward child AND its plugin child."""
         _kill_process_tree(self.process)
+
+    def maybe_open_browser(self) -> bool:
+        """Open the dashboard in a browser if the caller wanted it. Best-effort.
+
+        Call this AFTER printing the URL so a blocking/failing browser-open can
+        never hide the URL from the user. Records and returns browser_opened.
+        """
+        if self.want_browser and self.url and not self.browser_opened:
+            self.browser_opened = _open_browser(self.url)
+        return self.browser_opened
 
 
 def mint_token(instance_id: str, profile: str = "", region: str = "", *, ttl: str = "6h") -> str:
@@ -240,6 +255,258 @@ def connect(
     )
 
 
+# --- SSH transport (Lightsail lane) -----------------------------------------
+# Lightsail instances have no SSM agent, so the dashboard (loopback-only on the
+# box) is reached over an SSH local-forward instead of an SSM port-forward. These
+# are the SSH analogs of mint_token / connect above; the readiness, ownership and
+# token-after-ready guards are identical, only the transport differs.
+
+# Non-interactive ssh options: no host-key prompt on a fresh box, no agent, use
+# only the key we pass. BatchMode fails fast instead of hanging on a prompt.
+# StrictHostKeyChecking=no (NOT accept-new): a cloud box regenerates its host
+# keys every launch so there is nothing stable to pin, and `accept-new` is
+# rejected by older OpenSSH clients ("unsupported option accept-new"), which
+# broke connect on hosts shipping an older ssh. Paired with
+# UserKnownHostsFile=/dev/null the key is discarded regardless, so `no` and
+# `accept-new` are behaviourally identical here minus the compat break.
+_SSH_BASE_OPTS = [
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "StrictHostKeyChecking=no",
+    "-o",
+    "UserKnownHostsFile=/dev/null",
+    "-o",
+    "ConnectTimeout=10",
+]
+
+
+def _ssh_target(ssh_host: str) -> str:
+    """``user@host`` as given, or ``ubuntu@host`` when no user is present."""
+    return ssh_host if "@" in ssh_host else f"ubuntu@{ssh_host}"
+
+
+def mint_token_ssh(
+    ssh_host: str, key_path: str, *, ttl: str = "6h", remote_port: int = DEFAULT_REMOTE_DASHBOARD_PORT
+) -> str:
+    """Mint a dashboard token on the box over SSH; return the bare token.
+
+    Runs ``kirocrew token`` on the instance via a one-shot SSH command and parses
+    the token out of the printed loopback URL. Returns "" if it could not be
+    obtained. The token transits the encrypted SSH channel (not SSM command
+    history), so the SSM mint's history caveat does not apply here.
+    """
+    # Run through a LOGIN shell (bash -lc): the one-line installer puts the
+    # kirocrew entrypoint in ~/.local/bin, which is on the login PATH but NOT on
+    # a non-login one-shot SSH command's PATH (/usr/bin:/bin:…). Without -l the
+    # remote `kirocrew` is not found, the pipe yields nothing, and the mint
+    # silently fails with "could not mint a token" even though the gateway is up.
+    remote = f"kirocrew token --ttl {_safe_ttl(ttl)} 2>/dev/null | grep -m1 'token=' || true"
+    cmd = [
+        "ssh",
+        *_SSH_BASE_OPTS,
+        "-i",
+        key_path,
+        _ssh_target(ssh_host),
+        f"bash -lc {shlex.quote(remote)}",
+    ]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        logger.warning("ssh token mint failed: %s", exc)
+        return ""
+    m = _TOKEN_RE.search((res.stdout or "").strip())
+    return m.group(1) if m else ""
+
+
+def ssh_gateway_active(
+    ssh_host: str, key_path: str, *, remote_port: int = DEFAULT_REMOTE_DASHBOARD_PORT
+) -> bool:
+    """True when the gateway service is active on the box and answers on loopback.
+
+    One SSH round trip: ``systemctl is-active`` on the ``kirocrew`` unit, then a
+    request to the dashboard port. ``curl`` exits 0 on any HTTP response, so a
+    redirect or an auth page counts as "answering". Any SSH failure (host not yet
+    reachable, key rejected, timeout) is False; the caller keeps polling.
+    """
+    remote = (
+        "systemctl is-active --quiet kirocrew && "
+        f"curl -s -o /dev/null --max-time 5 http://127.0.0.1:{int(remote_port)}/"
+    )
+    cmd = ["ssh", *_SSH_BASE_OPTS, "-i", key_path, _ssh_target(ssh_host), remote]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        logger.debug("gateway probe failed: %s", exc)
+        return False
+    return res.returncode == 0
+
+
+def open_ssh_forward(
+    ssh_host: str, key_path: str, remote_port: int, local_port: int
+) -> Optional[subprocess.Popen]:
+    """Spawn an ``ssh -N -L local:localhost:remote`` local-forward child.
+
+    Returns the Popen (caller owns teardown) or None if ssh could not be spawned.
+    """
+    cmd = [
+        "ssh",
+        *_SSH_BASE_OPTS,
+        "-i",
+        key_path,
+        "-N",
+        "-L",
+        f"{local_port}:127.0.0.1:{remote_port}",
+        _ssh_target(ssh_host),
+    ]
+    try:
+        return subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            # CRITICAL: own session/process group. _terminate() tears the tunnel
+            # down with os.killpg(getpgid(child)); without start_new_session the
+            # child shares THIS process's group, so that killpg signals the
+            # parent CLI (and the shell's foreground group) too. The SSM path
+            # (open_port_forward) sets this for the same reason.
+            start_new_session=True,
+        )
+    except OSError as exc:
+        logger.warning("could not spawn ssh forward: %s", exc)
+        return None
+
+
+def _drain_ssh_output(proc: Optional[subprocess.Popen], *, limit: int = 400) -> str:
+    """Best-effort read of a failed ssh child's combined output for diagnostics.
+
+    ``open_ssh_forward`` routes stderr into the stdout pipe, so ssh's own
+    "Permission denied (publickey)" / "Connection refused" / "Connection timed
+    out" lands here. A failed child has already exited, so its pipe is at EOF and
+    the read returns at once; a short join bounds the pathological case. Returns a
+    compact one-line summary (last non-empty line, truncated), or "".
+    """
+    if proc is None or getattr(proc, "stdout", None) is None:
+        return ""
+    try:
+        proc.wait(timeout=_DRAIN_JOIN_TIMEOUT_SECS)
+    except Exception:  # noqa: BLE001 - still running / already reaped; read anyway
+        pass
+    try:
+        text = proc.stdout.read() or ""
+    except Exception:  # noqa: BLE001 - pipe closed/decode issue: nothing to show
+        return ""
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    # Prefer the last line that looks like ssh's actual verdict.
+    for ln in reversed(lines):
+        low = ln.lower()
+        if any(k in low for k in ("denied", "refused", "timed out", "timeout", "unreachable", "no route", "closed")):
+            return ln[:limit]
+    return lines[-1][:limit]
+
+
+def connect_ssh(
+    ssh_host: str,
+    key_path: str,
+    *,
+    instance_id: str = "",
+    remote_port: int = DEFAULT_REMOTE_DASHBOARD_PORT,
+    local_port: int = DEFAULT_LOCAL_PORT,
+    ttl: str = "6h",
+    open_browser: bool = True,
+) -> Connection:
+    """Open an SSH tunnel to the box, mint a token, and (optionally) open the dashboard.
+
+    The SSH analog of :func:`connect`. Same contract and ownership/teardown
+    guards; the only differences are the transport (``ssh -L`` instead of SSM)
+    and that the token mint rides the encrypted SSH channel. The caller owns
+    tunnel teardown via :meth:`Connection.close`.
+    """
+    # Import lazily to reuse the transport-agnostic socket probes without
+    # pulling the SSM module into every connect import path.
+    from kiro_crew.cloud.ssm import port_is_free, wait_for_local_port
+
+    iid = instance_id or ssh_host
+    if not port_is_free(local_port):
+        return Connection(
+            instance_id=iid,
+            local_port=local_port,
+            remote_port=remote_port,
+            ready=False,
+            error=(
+                f"local port {local_port} is already in use — close whatever is "
+                f"using it, or pass --local-port <n>, then retry."
+            ),
+        )
+    proc = open_ssh_forward(ssh_host, key_path, remote_port, local_port)
+    if proc is None:
+        return Connection(
+            instance_id=iid,
+            local_port=local_port,
+            remote_port=remote_port,
+            ready=False,
+            error="could not start ssh (is the OpenSSH client installed and on PATH?)",
+        )
+    ready = wait_for_local_port(local_port, proc=proc)
+    # Same free-check->bind race close as the SSM path: a listener answering
+    # while our ssh child has exited is a foreign process, not our tunnel.
+    if ready and proc.poll() is not None:
+        logger.warning(
+            "local port %d answered but the ssh child exited — refusing to route the "
+            "dashboard token to a foreign listener",
+            local_port,
+        )
+        ready = False
+    token = ""
+    url = ""
+    browser_opened = False
+    error = ""
+    if not ready:
+        ssh_output = _drain_ssh_output(proc)
+        error = (
+            "the SSH tunnel did not become ready — the box may still be installing "
+            "(wait ~2 min after launch and retry), or SSH (port 22) may be unreachable."
+        )
+        if ssh_output:
+            # ssh's own diagnostic is the one that actually tells auth failure
+            # (Permission denied), connection refused, and timeout apart. Surface
+            # it rather than making the user re-run ssh by hand to see it.
+            error += f"\n    ssh said: {ssh_output}"
+        _terminate(proc)
+    else:
+        token = mint_token_ssh(ssh_host, key_path, ttl=ttl, remote_port=remote_port)
+        if not token:
+            error = (
+                "connected the SSH tunnel but could not mint a dashboard token on the "
+                "instance — the gateway may still be starting. Wait ~1 min and retry."
+            )
+            _terminate(proc)
+            ready = False
+        else:
+            url = build_url(local_port, token)
+            # NB: the browser-open is deliberately NOT done here. On some hosts
+            # webbrowser.open() blocks the foreground (a text browser attached to
+            # the tty), which would stall before the caller ever prints the URL,
+            # leaving the user with no URL and a hung process. The caller prints
+            # the URL FIRST, then opens the browser via maybe_open_browser(),
+            # so a blocking/failing open can never hide the URL. open_browser is
+            # recorded on the Connection so the caller knows whether to try.
+    return Connection(
+        instance_id=iid,
+        local_port=local_port,
+        remote_port=remote_port,
+        token=token,
+        url=url,
+        ready=ready,
+        browser_opened=browser_opened,
+        want_browser=open_browser,
+        error=error,
+        process=proc,
+    )
+
+
 # --- Instances registry integration (managed experience) --------------------
 
 
@@ -346,6 +613,71 @@ def register_instance(
         return None
 
 
+def register_instance_ssh(
+    ssh_host: str,
+    *,
+    name: str,
+    profile: str = "",
+    region: str = "",
+    remote_port: int = DEFAULT_REMOTE_DASHBOARD_PORT,
+    provisioner_id: str = BUILTIN_PROVISIONER_ID,
+) -> Optional[str]:
+    """Register an SSH-transport box in the Instances registry (the Lightsail lane).
+
+    The SSH sibling of :func:`register_instance`. Lightsail instances have no SSM
+    agent to tunnel through, so the dashboard reaches them over an SSH tunnel: the
+    record carries ``connection_method="ssh"`` and *ssh_host* (``user@public-ip``)
+    instead of an ``ssm_target``. Everything else -- the loopback-only gateway, the
+    token refresh, the forward -- is the dashboard's existing SSH transport, which
+    predates this lane (it is how a hand-added Remote crew over SSH already
+    works), so no new connect machinery is added here.
+
+    *ssh_host* is ``user@host`` (e.g. ``ubuntu@203.0.113.5``) -- the registry's SSH
+    charset admits the ``@``. *provisioner_id* records the lane that created the
+    box so the dashboard shows the right lifecycle guidance and resolves the
+    Lightsail engine for Stop/Start/Delete.
+
+    Best-effort: returns the registered instance id, or None if the Instances
+    feature isn't available. Idempotent per box: a re-launch updates the prior
+    record in place (matched by ``ssh_host``), preserving its id, allocated local
+    port, TTL and sticky connect intent -- rather than accumulating duplicates.
+    """
+    if not ssh_host:
+        return None
+    try:
+        from kiro_crew.instances.registry import InstancesRegistry
+    except Exception:  # pragma: no cover - instances feature absent
+        logger.info("Instances feature unavailable; skipping SSH registration")
+        return None
+    try:
+        reg = InstancesRegistry()
+        for existing in reg.list():
+            if ssh_host == existing.ssh_host:
+                reg.update(
+                    existing.id,
+                    connection_method="ssh",
+                    ssh_host=ssh_host,
+                    aws_profile=profile,
+                    aws_region=region,
+                    remote_port=remote_port,
+                    provisioner_id=provisioner_id,
+                )
+                return existing.id
+        inst = reg.add(
+            name=name,
+            connection_method="ssh",
+            ssh_host=ssh_host,
+            aws_profile=profile,
+            aws_region=region,
+            remote_port=remote_port,
+            provisioner_id=provisioner_id,
+        )
+        return inst.id
+    except Exception as exc:  # pragma: no cover - non-fatal
+        logger.info("could not register SSH instance in Instances registry: %s", exc)
+        return None
+
+
 def is_launched_instance(ssm_target: str) -> bool:
     """True if *ssm_target* (an EC2 instance id) was provisioned by a Kiro Crew
     cloud launch, per the launch job store — i.e. it is a *correlated* instance,
@@ -394,6 +726,32 @@ def is_launched_instance(ssm_target: str) -> bool:
             continue
         if isinstance(raw, dict) and raw.get("instance_id") == ssm_target:
             return True
+    return False
+
+
+def update_instance_ssh_host(*, name: str, provisioner_id: str, ssh_host: str) -> bool:
+    """Point an existing SSH-transport record at a new ``user@ip``; True if one was updated.
+
+    A Lightsail box gets a new public IP when it is stopped and started (unless a
+    static IP is attached), and its record is matched on ``ssh_host``, so the
+    record has to follow the IP or the dashboard keeps dialling the old address.
+    Matched by the record's name and provisioner, because the old IP is no longer
+    known at that point.
+    """
+    if not (name and provisioner_id and ssh_host):
+        return False
+    try:
+        from kiro_crew.instances.registry import InstancesRegistry
+    except Exception:  # pragma: no cover - instances feature absent
+        return False
+    try:
+        reg = InstancesRegistry()
+        for inst in reg.list():
+            if inst.name == name and inst.provisioner_id == provisioner_id:
+                reg.update(inst.id, ssh_host=ssh_host)
+                return True
+    except Exception as exc:  # pragma: no cover - non-fatal
+        logger.info("could not update instance ssh_host: %s", exc)
     return False
 
 
@@ -498,15 +856,26 @@ def _safe_ttl(ttl: str) -> str:
 
 
 def _browser_open_supported() -> bool:
-    """Return false in headless Linux shells where webbrowser would call gio/xdg-open."""
+    """Return false in headless Linux shells where webbrowser would call gio/xdg-open.
+
+    A terminal-mode BROWSER (lynx/w3m/elinks/links/…) is treated as NO browser:
+    webbrowser.open() would launch it in the FOREGROUND attached to this tty,
+    blocking forever and swallowing the terminal before the URL is ever printed
+    (for example when the user's dotfiles set BROWSER=w3m). On a headless
+    host we want to print the URL, not hand the tty to a text browser.
+    """
     if os.environ.get("KIROCREW_NO_BROWSER"):
         return False
     if sys.platform.startswith("linux"):
-        return bool(
-            os.environ.get("DISPLAY")
-            or os.environ.get("WAYLAND_DISPLAY")
-            or os.environ.get("BROWSER")
+        browser = os.environ.get("BROWSER", "")
+        # A text-mode browser blocks the foreground — treat it as unsupported.
+        _TERMINAL_BROWSERS = ("lynx", "w3m", "elinks", "links", "links2", "edbrowse")
+        browser_is_terminal = any(
+            tb in browser.lower() for tb in _TERMINAL_BROWSERS
         )
+        if browser and not browser_is_terminal:
+            return True
+        return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
     return True
 
 
